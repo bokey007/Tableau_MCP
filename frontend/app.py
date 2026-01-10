@@ -268,20 +268,129 @@ if st.session_state.current_result:
                     use_container_width=True,
                 )
         
-        # Visualization recommendation
+        # Visualization rendering
         if result.get("visualization") and result["visualization"].get("chart_type") not in [None, "none", "table"]:
             viz = result["visualization"]
-            st.markdown("### 📈 Recommended Visualization")
+            st.markdown("### 📈 Visualization")
             
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.info(f"**Chart Type:** {viz.get('chart_type', 'table').title()}")
-                if viz.get("x_axis"):
-                    st.caption(f"X-Axis: {viz['x_axis']}")
-                if viz.get("y_axis"):
-                    st.caption(f"Y-Axis: {viz['y_axis']}")
-                if viz.get("reason"):
-                    st.caption(f"💡 {viz['reason']}")
+            # Only render if we have data
+            if result.get("results") and result["results"].get("data"):
+                import plotly.express as px
+                
+                chart_type = viz.get("chart_type", "bar")
+                x_axis = viz.get("x_axis")
+                y_axis = viz.get("y_axis")
+                
+                # Validate axes exist in data
+                columns = list(df.columns)
+                
+                # Find best matching columns if exact match not found
+                def find_column(target, cols):
+                    if not target:
+                        return None
+                    target_lower = target.lower()
+                    for col in cols:
+                        if col.lower() == target_lower:
+                            return col
+                    for col in cols:
+                        if target_lower in col.lower() or col.lower() in target_lower:
+                            return col
+                    return None
+                
+                x_col = find_column(x_axis, columns)
+                y_col = find_column(y_axis, columns)
+                
+                # Fallback: use first string column as x, first numeric as y
+                if not x_col or not y_col:
+                    for col in columns:
+                        if df[col].dtype == 'object' and not x_col:
+                            x_col = col
+                        elif df[col].dtype in ['int64', 'float64'] and not y_col:
+                            y_col = col
+                
+                try:
+                    fig = None
+                    plot_df = df.copy()
+                    
+                    # For line charts with time series, aggregate the data
+                    if chart_type == "line" and x_col and y_col:
+                        # Check if x_col looks like a date
+                        try:
+                            plot_df[x_col] = pd.to_datetime(plot_df[x_col])
+                            # Aggregate by date - sum the y values
+                            plot_df = plot_df.groupby(x_col)[y_col].sum().reset_index()
+                            plot_df = plot_df.sort_values(x_col)
+                        except:
+                            pass  # Not a date column, proceed as-is
+                        
+                        fig = px.line(
+                            plot_df, x=x_col, y=y_col,
+                            title=f"{y_col} over {x_col}",
+                            markers=True,
+                            color_discrete_sequence=["#667eea"]
+                        )
+                    elif chart_type == "bar" and x_col and y_col:
+                        # For bar charts, aggregate if there are duplicates in x
+                        if plot_df[x_col].duplicated().any():
+                            plot_df = plot_df.groupby(x_col)[y_col].sum().reset_index()
+                            plot_df = plot_df.sort_values(y_col, ascending=False).head(20)  # Top 20
+                        
+                        fig = px.bar(
+                            plot_df, x=x_col, y=y_col,
+                            title=f"{y_col} by {x_col}",
+                            color_discrete_sequence=["#667eea"]
+                        )
+                    elif chart_type == "scatter" and x_col and y_col:
+                        fig = px.scatter(
+                            plot_df, x=x_col, y=y_col,
+                            title=f"{y_col} vs {x_col}",
+                            color_discrete_sequence=["#667eea"]
+                        )
+                    elif chart_type == "pie" and x_col and y_col:
+                        # Aggregate for pie charts
+                        plot_df = plot_df.groupby(x_col)[y_col].sum().reset_index()
+                        plot_df = plot_df.nlargest(10, y_col)  # Top 10 for readability
+                        
+                        fig = px.pie(
+                            plot_df, names=x_col, values=y_col,
+                            title=f"Distribution of {y_col} by {x_col}"
+                        )
+                    elif x_col and y_col:
+                        # Default to bar chart with aggregation
+                        if plot_df[x_col].duplicated().any():
+                            plot_df = plot_df.groupby(x_col)[y_col].sum().reset_index()
+                            plot_df = plot_df.sort_values(y_col, ascending=False).head(20)
+                        
+                        fig = px.bar(
+                            plot_df, x=x_col, y=y_col,
+                            title=f"{y_col} by {x_col}",
+                            color_discrete_sequence=["#667eea"]
+                        )
+                    
+                    if fig:
+                        # Apply dark theme styling
+                        fig.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#e2e8f0"),
+                            title_font_size=16,
+                            margin=dict(t=50, l=50, r=50, b=50),
+                            xaxis_title=x_col,
+                            yaxis_title=y_col,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Show chart info
+                        st.caption(f"💡 {viz.get('reason', 'Auto-generated visualization')}")
+                    else:
+                        st.info(f"📊 Recommended: {chart_type.title()} chart with {x_col} and {y_col}")
+                        
+                except Exception as e:
+                    st.warning(f"Could not render {chart_type} chart: {str(e)}")
+                    st.info(f"📊 Recommended: {chart_type.title()} chart | X: {x_axis} | Y: {y_axis}")
+            else:
+                st.info(f"📊 Recommended: {viz.get('chart_type', 'table').title()} chart")
         
         # Feedback section
         st.divider()

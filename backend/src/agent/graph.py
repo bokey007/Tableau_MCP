@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, TypedDict
 
+import pandas as pd
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
@@ -66,20 +68,31 @@ QUERY_BUILDER_PROMPT = """Build a VizQL query to answer this question: {question
 Available fields in the datasource:
 {fields}
 
-Important rules:
-1. Use exact field names from the list above
-2. For measures, include a "function" like "SUM", "AVG", "COUNT", "MIN", "MAX"
-3. Add "sortDirection": "DESC" or "ASC" inside field definitions if ordering is needed
-4. Only use fields that exist in the schema
-5. Do NOT include "sort" or "limit" keys at the top level of the JSON
+CRITICAL RULES - Follow exactly:
+1. Use EXACT field names from the list above (case-sensitive)
+2. For measures (numeric values), ALWAYS include "function": "SUM" (or "AVG", "COUNT", "MIN", "MAX" as appropriate)
+3. For dimensions (categories, dates), do NOT include a function
+4. The query aggregates data: measures are summed/averaged BY dimensions
+5. Include "sortDirection": "DESC" or "ASC" inside the measure field if ordering is needed
+6. ONLY use "fields" key - do NOT use "filters", "sort", or "limit" (filtering will be done after query)
+7. For time-based questions (last year, this month, etc.), include the date field and filter in Python later
 
-Return ONLY a valid JSON object with this structure:
+Example for "sales by year":
 {{
   "fields": [
-    {{"fieldCaption": "ExactFieldName"}},
-    {{"fieldCaption": "MeasureName", "function": "SUM"}}
+    {{"fieldCaption": "Order Date"}},
+    {{"fieldCaption": "Sales", "function": "SUM", "sortDirection": "DESC"}}
   ]
-}}"""
+}}
+
+Example for "total profit" (just get all profit data):
+{{
+  "fields": [
+    {{"fieldCaption": "Profit", "function": "SUM"}}
+  ]
+}}
+
+Return ONLY a valid JSON object with "fields" array. No filters, no explanation, no markdown."""
 
 
 ANALYZER_PROMPT = """Analyze these query results to answer: {question}
@@ -128,6 +141,12 @@ class TableauAgent:
                 max_retries=settings.openai_max_retries,
             )
         return self._llm
+    
+    @property
+    def llm_with_calculator(self) -> ChatOpenAI:
+        """Get LLM with calculator tools bound for accurate math."""
+        from src.agent.tools import CALCULATOR_TOOLS
+        return self.llm.bind_tools(CALCULATOR_TOOLS)
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow."""
@@ -306,7 +325,11 @@ class TableauAgent:
                 return state
             
             state["query"] = query
-            logger.info("Generated query", fields=len(query.get("fields", [])))
+            logger.info(
+                "Generated VizQL query",
+                fields=len(query.get("fields", [])),
+                query=query,  # Log the full query for debugging
+            )
             
         except Exception as e:
             logger.error("Query generation failed", error=str(e))
@@ -341,29 +364,315 @@ class TableauAgent:
             state["status"] = "complete"
             return state
         
-        # Generate analysis
+        # NOTE: Keep ALL data in result for display and visualization
+        # Only prepare a summary/sample for LLM analysis
+        import pandas as pd
+        
         try:
+            df = pd.DataFrame(result.data)
+            total_rows = len(df)
+            
+            # Prepare data for LLM (aggregated or sampled)
+            # This does NOT modify the actual result.data
+            llm_df = self._prepare_data_for_llm(df.copy(), question)
+            
+            # Convert to markdown for LLM
+            MAX_ROWS_FOR_LLM = 50
+            is_truncated = len(llm_df) > MAX_ROWS_FOR_LLM or len(llm_df) < total_rows
+            
+            if len(llm_df) > MAX_ROWS_FOR_LLM:
+                summary_text = llm_df.head(MAX_ROWS_FOR_LLM).to_markdown(index=False)
+                summary_text += f"\n\n⚠️ **Note**: Showing {MAX_ROWS_FOR_LLM} of {len(llm_df)} aggregated rows"
+            else:
+                summary_text = llm_df.to_markdown(index=False)
+            
+            # Add data context
+            if total_rows != len(llm_df):
+                summary_text += f"\n\n📊 **Data Context**: Original query returned {total_rows:,} rows, aggregated to {len(llm_df)} rows for analysis."
+            
+            # Add summary statistics (calculated from FULL data, not sample)
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            if numeric_cols:
+                stats_text = "\n\n**Summary Statistics (from complete dataset):**\n"
+                for col in numeric_cols[:3]:
+                    stats_text += f"- {col}: Total = {df[col].sum():,.2f}, Avg = {df[col].mean():,.2f}, Min = {df[col].min():,.2f}, Max = {df[col].max():,.2f}\n"
+                summary_text += stats_text
+            
+            analysis_data = summary_text
+            
+        except Exception as e:
+            logger.warning("Pre-aggregation failed, using raw sample", error=str(e))
+            analysis_data = result.to_markdown_table(max_rows=30)
+            analysis_data += f"\n\n⚠️ Note: Showing sample of {min(30, result.row_count)} rows from {result.row_count} total rows."
+        
+        # Generate analysis with prepared data
+        try:
+            from src.agent.tools import calculate, calculate_percentage, calculate_growth
+            
             prompt = ANALYZER_PROMPT.format(
                 question=question,
-                results=result.to_markdown_table(max_rows=50),
+                results=analysis_data,
             )
             
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are a senior data analyst providing clear, actionable insights."),
-                HumanMessage(content=prompt),
-            ])
+            system_msg = """You are a senior data analyst. Important notes:
+1. The data shown may be aggregated or sampled from a larger dataset
+2. Summary statistics shown are from the COMPLETE dataset - use these for totals
+3. If you need to perform ANY calculations (percentages, growth rates, ratios, etc.), 
+   use the calculator tools provided - do NOT calculate in your head
+4. If data is truncated, acknowledge this in your analysis
+5. Provide clear, actionable insights based on the patterns shown
+
+Available calculator tools:
+- calculate("expression"): For any math like "1500000 + 2500000" or "(45000 / 12) * 100"
+- calculate_percentage(value, total): Get what % value is of total
+- calculate_growth(old_value, new_value): Get growth rate between two values"""
             
-            state["analysis"] = response.content
+            # Use LLM with calculator tools
+            messages = [
+                SystemMessage(content=system_msg),
+                HumanMessage(content=prompt),
+            ]
+            
+            # First call - may include tool calls
+            response = await self.llm_with_calculator.ainvoke(messages)
+            
+            # Handle tool calls if any
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                from langchain_core.messages import AIMessage, ToolMessage
+                
+                # Execute each tool call
+                tool_results = []
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call['name']
+                    tool_args = tool_call['args']
+                    
+                    logger.info(f"Executing calculator tool", tool=tool_name, args=tool_args)
+                    
+                    # Execute the tool
+                    if tool_name == 'calculate':
+                        result_val = calculate.invoke(tool_args['expression'])
+                    elif tool_name == 'calculate_percentage':
+                        result_val = calculate_percentage.invoke(tool_args)
+                    elif tool_name == 'calculate_growth':
+                        result_val = calculate_growth.invoke(tool_args)
+                    else:
+                        result_val = f"Unknown tool: {tool_name}"
+                    
+                    tool_results.append(ToolMessage(
+                        content=str(result_val),
+                        tool_call_id=tool_call['id']
+                    ))
+                
+                # Add tool results and get final response
+                messages.append(response)
+                messages.extend(tool_results)
+                
+                final_response = await self.llm.ainvoke(messages)
+                state["analysis"] = final_response.content
+            else:
+                # No tool calls, use direct response
+                state["analysis"] = response.content
             
         except Exception as e:
             logger.error("Analysis failed", error=str(e))
             state["analysis"] = f"Analysis generation failed: {e}\n\nRaw data returned: {result.row_count} rows."
         
-        # Recommend visualization
+        # Visualization uses FULL data (result.data is unchanged)
         state["visualization"] = self._recommend_visualization(result)
         state["status"] = "complete"
         
         return state
+    
+    def _prepare_data_for_llm(self, df: pd.DataFrame, question: str) -> pd.DataFrame:
+        """
+        Prepare data specifically for LLM analysis.
+        This may aggregate or sample data, but does NOT affect the display data.
+        """
+        return self._pre_aggregate_data(df, question)
+    
+    def _pre_aggregate_data(self, df: pd.DataFrame, question: str) -> pd.DataFrame:
+        """Pre-aggregate data based on the question to avoid LLM calculation errors."""
+        import pandas as pd
+        import re
+        from datetime import datetime, timedelta
+        
+        question_lower = question.lower()
+        original_row_count = len(df)
+        
+        # Detect date columns
+        date_cols = []
+        for col in df.columns:
+            if any(keyword in col.lower() for keyword in ['date', 'time', 'year', 'month', 'day']):
+                try:
+                    df[col] = pd.to_datetime(df[col])
+                    date_cols.append(col)
+                except:
+                    pass
+        
+        # Detect numeric columns (likely measures)
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        
+        # Detect string columns (likely dimensions)
+        string_cols = df.select_dtypes(include=['object']).columns.tolist()
+        string_cols = [c for c in string_cols if c not in date_cols]
+        
+        # ========================================
+        # 0. Apply date-based filtering (done in Python since MCP filters are complex)
+        # ========================================
+        if date_cols:
+            date_col = date_cols[0]
+            now = datetime.now()
+            current_year = now.year
+            
+            # Filter for "last year" / "previous year"
+            if any(phrase in question_lower for phrase in ['last year', 'previous year']):
+                df = df[df[date_col].dt.year == (current_year - 1)]
+                logger.info(f"Filtered to last year ({current_year - 1})", rows_after=len(df))
+            
+            # Filter for "this year" / "current year"
+            elif any(phrase in question_lower for phrase in ['this year', 'current year']):
+                df = df[df[date_col].dt.year == current_year]
+                logger.info(f"Filtered to this year ({current_year})", rows_after=len(df))
+            
+            # Filter for "last month"
+            elif 'last month' in question_lower:
+                last_month = now.replace(day=1) - timedelta(days=1)
+                df = df[(df[date_col].dt.year == last_month.year) & 
+                        (df[date_col].dt.month == last_month.month)]
+                logger.info(f"Filtered to last month", rows_after=len(df))
+            
+            # Filter for "this month"
+            elif 'this month' in question_lower:
+                df = df[(df[date_col].dt.year == now.year) & 
+                        (df[date_col].dt.month == now.month)]
+                logger.info(f"Filtered to this month", rows_after=len(df))
+            
+            # Filter for specific year mentioned (e.g., "in 2025", "for 2024")
+            year_match = re.search(r'\b(20\d{2})\b', question_lower)
+            if year_match and not any(phrase in question_lower for phrase in 
+                ['last year', 'this year', 'previous year', 'current year', 'by year']):
+                target_year = int(year_match.group(1))
+                df = df[df[date_col].dt.year == target_year]
+                logger.info(f"Filtered to year {target_year}", rows_after=len(df))
+        
+        # ========================================
+        # 1. Handle "top N" / "bottom N" requests
+        # ========================================
+        top_n_match = re.search(r'\b(top|bottom|first|last)\s*(\d+)\b', question_lower)
+        if top_n_match:
+            direction = top_n_match.group(1)
+            n = int(top_n_match.group(2))
+            
+            if numeric_cols:
+                sort_col = numeric_cols[0]
+                ascending = direction in ['bottom', 'last']
+                
+                # If there are duplicates in the dimension, aggregate first
+                if string_cols and df[string_cols[0]].duplicated().any():
+                    agg_dict = {col: 'sum' for col in numeric_cols}
+                    df = df.groupby(string_cols[0]).agg(agg_dict).reset_index()
+                
+                result = df.sort_values(sort_col, ascending=ascending).head(n)
+                logger.info(f"Extracted {direction} {n}", rows=len(result))
+                return result
+        
+        # ========================================
+        # 2. Date-based aggregations
+        # ========================================
+        if date_cols and numeric_cols:
+            date_col = date_cols[0]
+            
+            # Aggregate by year
+            if any(word in question_lower for word in ['by year', 'yearly', 'annual', 'per year', 'each year']):
+                df['Year'] = df[date_col].dt.year
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                result = df.groupby('Year').agg(agg_dict).reset_index()
+                result = result.sort_values('Year')
+                logger.info("Pre-aggregated by year", rows=len(result))
+                return result
+            
+            # Aggregate by month
+            if any(word in question_lower for word in ['by month', 'monthly', 'per month', 'each month']):
+                df['Month'] = df[date_col].dt.to_period('M').astype(str)
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                result = df.groupby('Month').agg(agg_dict).reset_index()
+                result = result.sort_values('Month')
+                logger.info("Pre-aggregated by month", rows=len(result))
+                return result
+            
+            # Aggregate by quarter
+            if any(word in question_lower for word in ['by quarter', 'quarterly', 'per quarter', 'each quarter']):
+                df['Quarter'] = df[date_col].dt.to_period('Q').astype(str)
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                result = df.groupby('Quarter').agg(agg_dict).reset_index()
+                result = result.sort_values('Quarter')
+                logger.info("Pre-aggregated by quarter", rows=len(result))
+                return result
+            
+            # Trends - aggregate by date
+            if any(word in question_lower for word in ['trend', 'over time', 'time series']):
+                df['Date'] = df[date_col].dt.date
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                result = df.groupby('Date').agg(agg_dict).reset_index()
+                result = result.sort_values('Date')
+                logger.info("Pre-aggregated by date", rows=len(result))
+                return result
+        
+        # ========================================
+        # 3. Dimension-based aggregation (by category, product, customer, etc.)
+        # ========================================
+        for keyword in ['by category', 'by product', 'by customer', 'by region', 'by segment', 'by state', 'by city']:
+            if keyword in question_lower:
+                dimension_name = keyword.replace('by ', '')
+                # Find matching column
+                for col in string_cols:
+                    if dimension_name in col.lower():
+                        if numeric_cols:
+                            agg_dict = {c: 'sum' for c in numeric_cols}
+                            result = df.groupby(col).agg(agg_dict).reset_index()
+                            result = result.sort_values(numeric_cols[0], ascending=False)
+                            logger.info(f"Pre-aggregated by {col}", rows=len(result))
+                            return result
+        
+        # ========================================
+        # 4. Handle large datasets (>50 rows) - Smart summarization
+        # ========================================
+        MAX_ROWS_FOR_LLM = 50
+        
+        if len(df) > MAX_ROWS_FOR_LLM:
+            logger.info(f"Large dataset detected ({len(df)} rows), applying smart summarization")
+            
+            # Option A: If we have dimensions, aggregate by the first one
+            if string_cols and numeric_cols:
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                result = df.groupby(string_cols[0]).agg(agg_dict).reset_index()
+                result = result.sort_values(numeric_cols[0], ascending=False).head(MAX_ROWS_FOR_LLM)
+                logger.info(f"Aggregated by {string_cols[0]}", original=original_row_count, final=len(result))
+                return result
+            
+            # Option B: If only numeric data, return statistical summary
+            if numeric_cols and not string_cols:
+                # Create a summary instead of raw data
+                summary_data = []
+                for col in numeric_cols:
+                    summary_data.append({
+                        'Metric': col,
+                        'Total': df[col].sum(),
+                        'Average': df[col].mean(),
+                        'Min': df[col].min(),
+                        'Max': df[col].max(),
+                        'Count': len(df)
+                    })
+                result = pd.DataFrame(summary_data)
+                logger.info("Created statistical summary", metrics=len(numeric_cols))
+                return result
+            
+            # Option C: Just take first N rows with a warning
+            result = df.head(MAX_ROWS_FOR_LLM)
+            logger.warning(f"Truncated to {MAX_ROWS_FOR_LLM} rows", original=original_row_count)
+            return result
+        
+        return df
     
     def _extract_json(self, text: str) -> Optional[Dict[str, Any]]:
         """Extract JSON from LLM response text."""

@@ -311,11 +311,22 @@ class MCPClient:
         """
         start_time = time.monotonic()
         
-        # Sanitize query to remove unsupported top-level keys
+        # Sanitize query - ONLY use fields, remove filters to avoid schema issues
+        # Date/time filtering is done in Python post-processing
         sanitized_query = {
-            k: v for k, v in query.items() 
-            if k in ["fields", "filters", "parameters"]
+            "fields": query.get("fields", [])
         }
+        
+        # Only include parameters if they exist and are valid
+        if query.get("parameters"):
+            sanitized_query["parameters"] = query["parameters"]
+        
+        # Log if we're stripping out filters (for debugging)
+        if query.get("filters"):
+            logger.warning(
+                "Stripping filters from query (unsupported schema)",
+                filter_count=len(query.get("filters", []))
+            )
 
         result = await self.call_tool("query-datasource", {
             "datasourceLuid": datasource_id,

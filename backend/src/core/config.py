@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # OpenAI - Default to empty string for graceful startup
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4-turbo-preview")
-    openai_temperature: float = Field(default=0.1)
+    openai_temperature: float = Field(default=0.0)  # 0 for consistent query generation
     openai_max_retries: int = Field(default=3)
     
     # Tableau MCP Server

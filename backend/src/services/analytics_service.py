@@ -101,14 +101,15 @@ class AnalyticsService:
         avg_time = avg_time_result.scalar()
         
         # Queries per day
+        date_trunc_expr = func.date_trunc('day', Query.created_at)
         daily_result = await self.db.execute(
             select(
-                func.date_trunc('day', Query.created_at).label('date'),
+                date_trunc_expr.label('date'),
                 func.count(Query.id)
             )
             .where(and_(*conditions))
-            .group_by(func.date_trunc('day', Query.created_at))
-            .order_by(desc('date'))
+            .group_by(date_trunc_expr)
+            .order_by(date_trunc_expr.desc())
         )
         daily = [
             {"date": row[0].isoformat() if row[0] else None, "count": row[1]}
