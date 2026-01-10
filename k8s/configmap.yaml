@@ -1,0 +1,30 @@
+# =============================================================================
+# Kubernetes ConfigMap
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tableau-mcp-config
+  namespace: tableau-mcp
+data:
+  # App
+  APP_ENV: "production"
+  LOG_LEVEL: "WARNING"
+
+  # Database
+  POSTGRES_DB: "tableau_mcp_db"
+
+  # Tableau
+  TABLEAU_SERVER: "https://prod-useast-c.online.tableau.com"
+  TABLEAU_SITE_NAME: "your-site-name"
+
+  # MCP
+  MCP_TRANSPORT: "http"
+  MCP_PORT: "3927"
+
+  # OpenAI
+  OPENAI_MODEL: "gpt-4-turbo-preview"
+
+  # Activity
+  ENABLE_ACTIVITY_TRACKING: "true"
+  ACTIVITY_RETENTION_DAYS: "90"

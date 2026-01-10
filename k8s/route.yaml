@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenShift Route (Ingress equivalent for OpenShift)
+# =============================================================================
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: tableau-mcp-agent
+  namespace: tableau-mcp
+  labels:
+    app.kubernetes.io/name: tableau-mcp-agent
+    app.kubernetes.io/component: route
+spec:
+  host: tableau-mcp-agent.apps.your-cluster.com # Update with your cluster domain
+  to:
+    kind: Service
+    name: tableau-mcp-agent
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+# =============================================================================
+# Kubernetes Ingress (Alternative to OpenShift Route)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tableau-mcp-agent
+  namespace: tableau-mcp
+  labels:
+    app.kubernetes.io/name: tableau-mcp-agent
+    app.kubernetes.io/component: ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - tableau-mcp-agent.your-domain.com # Update with your domain
+      secretName: tableau-mcp-tls # Create TLS secret separately
+  rules:
+    - host: tableau-mcp-agent.your-domain.com # Update with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tableau-mcp-agent
+                port:
+                  number: 8000

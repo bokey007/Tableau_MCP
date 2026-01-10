@@ -1,0 +1,396 @@
+# =============================================================================
+# Streamlit Main Application
+# =============================================================================
+"""
+Tableau MCP AI Agent - Streamlit Frontend
+
+A modern, interactive UI for querying Tableau data using natural language.
+"""
+
+import streamlit as st
+from datetime import datetime
+
+# Import shared API client
+from components.api_client import api_client as api
+
+# Page config
+st.set_page_config(
+    page_title="Tableau AI Agent",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    /* Main container */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 1200px;
+    }
+    
+    /* Response container */
+    .response-container {
+        background: linear-gradient(135deg, #1a1f2c 0%, #2d3748 100%);
+        border-radius: 1rem;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        border-left: 4px solid #667eea;
+    }
+    
+    /* Success/Error messages */
+    .stSuccess, .stError, .stWarning, .stInfo {
+        border-radius: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# =============================================================================
+# Session State Initialization
+# =============================================================================
+
+if "username" not in st.session_state:
+    st.session_state.username = "default_user"
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
+if "current_query_id" not in st.session_state:
+    st.session_state.current_query_id = None
+if "current_result" not in st.session_state:
+    st.session_state.current_result = None
+if "feedback_given" not in st.session_state:
+    st.session_state.feedback_given = False
+if "selected_datasource" not in st.session_state:
+    st.session_state.selected_datasource = None
+
+
+# =============================================================================
+# Sidebar
+# =============================================================================
+
+with st.sidebar:
+    # Logo/Title
+    st.markdown("# 🎯 Tableau AI")
+    st.caption("Intelligent Data Analysis")
+    
+    st.divider()
+    
+    # User identification
+    st.subheader("👤 User")
+    username = st.text_input(
+        "Username", 
+        value=st.session_state.username, 
+        key="username_input",
+        help="Enter your username to track your queries"
+    )
+    if username != st.session_state.username:
+        st.session_state.username = username
+    
+    st.divider()
+    
+    # Health status
+    st.subheader("🔌 Status")
+    health = api.health_check()
+    
+    if health.get("status") == "healthy":
+        st.success("✅ All Systems Go")
+        with st.expander("Details"):
+            st.caption(f"🗄️ Database: {'✅' if health.get('database_connected') else '❌'}")
+            st.caption(f"🔗 MCP: {'✅' if health.get('mcp_connected') else '❌'}")
+            st.caption(f"🤖 AI Config: {'✅' if health.get('checks', {}).get('openai_configured') else '❌'}")
+    elif health.get("status") == "degraded":
+        st.warning("⚠️ Degraded Mode")
+        with st.expander("Details"):
+            if not health.get("mcp_connected"):
+                st.caption("❌ MCP server not connected")
+            if not health.get("checks", {}).get("openai_configured"):
+                st.caption("❌ OpenAI not configured")
+    else:
+        st.error("❌ Backend Unavailable")
+        st.caption(health.get("error", "Check if backend is running"))
+    
+    st.divider()
+    
+    # Navigation
+    st.subheader("📍 Navigation")
+    st.page_link("app.py", label="Home", icon="🏠")
+    st.page_link("pages/history.py", label="Query History", icon="📜")
+    st.page_link("pages/analytics.py", label="Analytics", icon="📊")
+    st.page_link("pages/datasources.py", label="Datasources", icon="🗄️")
+    
+    st.divider()
+    
+    # Footer
+    st.caption("v1.0.0 | Powered by LangGraph")
+
+
+# =============================================================================
+# Main Content
+# =============================================================================
+
+# Header
+st.title("📊 Ask Your Data")
+st.caption("Use natural language to query and analyze your Tableau data")
+
+# Datasource selector
+st.subheader("1️⃣ Select Datasource (Optional)")
+
+datasources_response = api.list_datasources()
+datasources = datasources_response.get("datasources", [])
+
+if datasources_response.get("error"):
+    st.warning(f"⚠️ Could not load datasources: {datasources_response.get('error')}")
+    st.info("You can still ask questions - the agent will try to auto-detect the right datasource.")
+    selected_datasource_id = None
+elif datasources:
+    ds_options = ["🔍 Auto-detect (recommended)"] + [f"📊 {ds['name']}" for ds in datasources]
+    ds_ids = [None] + [ds["id"] for ds in datasources]
+    
+    # Check if we have a pre-selected datasource from datasources page
+    default_idx = 0
+    if st.session_state.selected_datasource:
+        try:
+            default_idx = ds_ids.index(st.session_state.selected_datasource)
+        except ValueError:
+            default_idx = 0
+    
+    selected_idx = st.selectbox(
+        "Choose a datasource or let AI auto-detect",
+        range(len(ds_options)),
+        index=default_idx,
+        format_func=lambda x: ds_options[x],
+        help="Auto-detect works best when your question references specific data concepts"
+    )
+    selected_datasource_id = ds_ids[selected_idx]
+else:
+    st.info("📭 No datasources available. Check your Tableau connection.")
+    selected_datasource_id = None
+
+st.divider()
+
+# Query input
+st.subheader("2️⃣ Ask Your Question")
+
+question = st.text_area(
+    "Enter your question about the data",
+    placeholder="Examples:\n• What are the top 5 customers by total sales?\n• Show me monthly revenue trends for 2024\n• Which products have the highest profit margin?",
+    height=120,
+    key="question_input",
+)
+
+# Submit button
+col1, col2, col3 = st.columns([1, 1, 3])
+with col1:
+    submit = st.button("🚀 Ask", type="primary", use_container_width=True, disabled=not question)
+with col2:
+    clear = st.button("🗑️ Clear", use_container_width=True)
+
+if clear:
+    st.session_state.current_result = None
+    st.session_state.current_query_id = None
+    st.session_state.feedback_given = False
+    st.session_state.selected_datasource = None
+    st.rerun()
+
+# Process query
+if submit and question:
+    if len(question.strip()) < 3:
+        st.error("❌ Question is too short. Please be more specific.")
+    else:
+        st.session_state.feedback_given = False
+        
+        with st.spinner("🤖 Analyzing your question..."):
+            result = api.query(
+                question=question,
+                datasource_id=selected_datasource_id,
+                username=st.session_state.username,
+            )
+            
+            st.session_state.current_result = result
+            st.session_state.current_query_id = result.get("query_id")
+            
+            # Add to local history
+            st.session_state.query_history.insert(0, {
+                "question": question,
+                "query_id": result.get("query_id"),
+                "success": result.get("success"),
+                "timestamp": datetime.now().isoformat(),
+            })
+
+# Display results
+if st.session_state.current_result:
+    result = st.session_state.current_result
+    
+    st.divider()
+    st.subheader("3️⃣ Results")
+    
+    if result.get("success"):
+        # Analysis
+        st.markdown("### 💡 Analysis")
+        analysis_text = result.get('analysis', 'No analysis available.')
+        st.markdown(analysis_text)
+        
+        # Execution info
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            row_count = result.get("results", {}).get("row_count", 0) if result.get("results") else 0
+            st.metric("📊 Rows", row_count)
+        with col2:
+            exec_time = result.get("execution_time_ms", 0)
+            st.metric("⏱️ Time", f"{exec_time:.0f}ms" if exec_time else "N/A")
+        with col3:
+            datasource = result.get("datasource", {})
+            ds_name = datasource.get("name", "Auto-detected")[:20] if datasource else "N/A"
+            st.metric("🗄️ Datasource", ds_name)
+        with col4:
+            query_id = result.get("query_id", "N/A")
+            st.metric("🔑 Query ID", query_id[:8] + "..." if query_id and len(query_id) > 8 else query_id)
+        
+        # Data table
+        if result.get("results") and result["results"].get("data"):
+            st.markdown("### 📋 Data")
+            import pandas as pd
+            
+            df = pd.DataFrame(result["results"]["data"])
+            st.dataframe(df, use_container_width=True, height=400)
+            
+            # Download button
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download CSV",
+                    csv,
+                    "query_results.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+        
+        # Visualization recommendation
+        if result.get("visualization") and result["visualization"].get("chart_type") not in [None, "none", "table"]:
+            viz = result["visualization"]
+            st.markdown("### 📈 Recommended Visualization")
+            
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.info(f"**Chart Type:** {viz.get('chart_type', 'table').title()}")
+                if viz.get("x_axis"):
+                    st.caption(f"X-Axis: {viz['x_axis']}")
+                if viz.get("y_axis"):
+                    st.caption(f"Y-Axis: {viz['y_axis']}")
+                if viz.get("reason"):
+                    st.caption(f"💡 {viz['reason']}")
+        
+        # Feedback section
+        st.divider()
+        st.markdown("### 👍 Was this helpful?")
+        
+        if not st.session_state.feedback_given:
+            col1, col2, col3 = st.columns([1, 1, 4])
+            
+            with col1:
+                if st.button("👍 Yes", key="like_btn", use_container_width=True):
+                    response = api.submit_feedback(
+                        query_id=st.session_state.current_query_id,
+                        feedback_type="like",
+                        username=st.session_state.username,
+                    )
+                    if not response.get("error"):
+                        st.session_state.feedback_given = True
+                        st.success("Thanks for your feedback! 🎉")
+                        st.rerun()
+                    else:
+                        st.error(response["error"])
+            
+            with col2:
+                if st.button("👎 No", key="dislike_btn", use_container_width=True):
+                    response = api.submit_feedback(
+                        query_id=st.session_state.current_query_id,
+                        feedback_type="dislike",
+                        username=st.session_state.username,
+                    )
+                    if not response.get("error"):
+                        st.session_state.feedback_given = True
+                        st.warning("Thanks for letting us know! 🔧")
+                        st.rerun()
+                    else:
+                        st.error(response["error"])
+            
+            # Detailed feedback
+            with st.expander("📝 Provide detailed feedback"):
+                rating = st.slider("Overall rating", 1, 5, 3)
+                comment = st.text_area("Comments (optional)", placeholder="Tell us how we can improve...")
+                
+                if st.button("Submit Detailed Feedback"):
+                    response = api.submit_feedback(
+                        query_id=st.session_state.current_query_id,
+                        feedback_type="like" if rating >= 3 else "dislike",
+                        rating=rating,
+                        comment=comment,
+                        username=st.session_state.username,
+                    )
+                    if not response.get("error"):
+                        st.session_state.feedback_given = True
+                        st.success("Thank you for your detailed feedback! 🙏")
+                        st.rerun()
+                    else:
+                        st.error(response["error"])
+        else:
+            st.success("✅ Feedback recorded. Thank you!")
+    
+    else:
+        # Error display
+        error_msg = result.get('error', 'Unknown error occurred')
+        error_type = result.get('error_type', 'unknown')
+        
+        st.error(f"❌ Query failed: {error_msg}")
+        
+        # Provide helpful suggestions based on error type
+        if error_type == "configuration_error":
+            st.info("""
+            **Configuration Issue**
+            - The AI service needs to be configured by an administrator
+            - Please contact support if this issue persists
+            """)
+        elif error_type == "connection_error":
+            st.info("""
+            **Connection Issue**
+            - The data service is temporarily unavailable
+            - Please try again in a few moments
+            """)
+        elif error_type == "ai_error":
+            st.info("""
+            **AI Service Unavailable**
+            - The AI service is temporarily busy
+            - Please try again in a moment
+            """)
+        else:
+            st.info("""
+            **Troubleshooting tips:**
+            - Make sure your question is clear and specific
+            - Try selecting a specific datasource instead of auto-detect
+            - Check if the backend and MCP server are running
+            """)
+        
+        # Still allow feedback on failures
+        if st.session_state.current_query_id and not st.session_state.feedback_given:
+            if st.button("📝 Report this issue"):
+                response = api.submit_feedback(
+                    query_id=st.session_state.current_query_id,
+                    feedback_type="dislike",
+                    comment=f"Query failed: {error_msg}",
+                    username=st.session_state.username,
+                )
+                if not response.get("error"):
+                    st.session_state.feedback_given = True
+                    st.info("Issue reported. Thank you for helping us improve!")
+
+
+# =============================================================================
+# Footer
+# =============================================================================
+
+st.divider()
+st.caption("© 2024 Tableau MCP AI Agent | Powered by LangGraph & OpenAI")

@@ -1,0 +1,53 @@
+# =============================================================================
+# MCP Server Dockerfile
+# =============================================================================
+# Tableau MCP Server using Node.js with Direct Trust authentication
+# =============================================================================
+
+FROM node:20-alpine
+
+LABEL maintainer="Tableau MCP Agent Team" \
+    version="1.0.0" \
+    description="Tableau MCP Server"
+
+# Install dependencies
+RUN apk add --no-cache curl wget
+
+WORKDIR /app
+
+# Install Tableau MCP Server - official package
+RUN npm install -g @tableau/mcp-server
+
+# Create logs directory with proper permissions for node user
+RUN mkdir -p /usr/local/lib/node_modules/@tableau/mcp-server/build/logs && \
+    chown -R node:node /usr/local/lib/node_modules/@tableau/mcp-server
+
+# Copy entrypoint script
+COPY <<EOF /app/entrypoint.sh
+#!/bin/sh
+set -e
+
+echo "Starting Tableau MCP Server..."
+echo "Transport: \${TRANSPORT:-http}"
+echo "Port: \${PORT:-3927}"
+echo "Server: \${SERVER}"
+echo "Site: \${SITE_NAME}"
+echo "Auth: \${AUTH:-direct-trust}"
+echo "JWT Sub Claim: \${JWT_SUB_CLAIM}"
+
+# Start MCP server using npx
+exec npx -y @tableau/mcp-server
+EOF
+
+RUN chmod +x /app/entrypoint.sh
+
+# Switch to non-root user (node user exists in node:alpine)
+USER node
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD wget -q --spider http://localhost:\${PORT:-3927}/health || exit 1
+
+EXPOSE 3927
+
+ENTRYPOINT ["/app/entrypoint.sh"]

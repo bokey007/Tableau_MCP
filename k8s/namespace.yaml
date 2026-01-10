@@ -1,0 +1,10 @@
+# =============================================================================
+# Kubernetes Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tableau-mcp
+  labels:
+    app.kubernetes.io/name: tableau-mcp-agent
+    app.kubernetes.io/component: namespace
