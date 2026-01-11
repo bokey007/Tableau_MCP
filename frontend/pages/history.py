@@ -198,18 +198,63 @@ else:
                     if detail.get("error"):
                         st.error(detail["error"])
                     else:
+                        # Analysis
                         st.markdown("### 💡 Analysis")
                         st.markdown(detail.get("analysis") or "_No analysis available_")
                         
-                        if detail.get("results") and detail["results"].get("data"):
-                            st.markdown("### 📊 Data (first 10 rows)")
-                            df = pd.DataFrame(detail["results"]["data"][:10])
-                            st.dataframe(df, use_container_width=True)
-                        
+                        # Generated Query
                         if detail.get("query"):
-                            st.markdown("### 🔧 Generated Query")
+                            st.markdown("### 🔧 Generated VizQL Query")
                             st.json(detail["query"])
                         
+                        # Data Section - Two columns for comparison
+                        st.markdown("### 📊 Data Comparison")
+                        
+                        col_raw, col_analyzed = st.columns(2)
+                        
+                        with col_raw:
+                            st.markdown("#### 📥 Data Returned from Query")
+                            if detail.get("results") and detail["results"].get("data"):
+                                raw_data = detail["results"]["data"]
+                                st.metric("Total Rows", detail["results"].get("row_count", len(raw_data)))
+                                df_raw = pd.DataFrame(raw_data)
+                                st.dataframe(df_raw, use_container_width=True, height=400)
+                                
+                                # Download raw data
+                                csv_raw = df_raw.to_csv(index=False)
+                                st.download_button(
+                                    "📥 Download Raw Data",
+                                    csv_raw,
+                                    f"raw_data_{query['id'][:8]}.csv",
+                                    "text/csv",
+                                    key=f"dl_raw_{query['id']}"
+                                )
+                            else:
+                                st.caption("No raw data available")
+                        
+                        with col_analyzed:
+                            st.markdown("#### 🤖 Data Passed to LLM")
+                            if detail.get("analyzed_data") and detail["analyzed_data"].get("data"):
+                                analyzed = detail["analyzed_data"]
+                                st.metric("Analyzed Rows", analyzed.get("row_count", "N/A"))
+                                st.caption(f"📊 {analyzed.get('description', 'Processed for LLM')}")
+                                
+                                df_analyzed = pd.DataFrame(analyzed["data"])
+                                st.dataframe(df_analyzed, use_container_width=True, height=400)
+                                
+                                # Download analyzed data
+                                csv_analyzed = df_analyzed.to_csv(index=False)
+                                st.download_button(
+                                    "📥 Download Analyzed Data",
+                                    csv_analyzed,
+                                    f"analyzed_data_{query['id'][:8]}.csv",
+                                    "text/csv",
+                                    key=f"dl_analyzed_{query['id']}"
+                                )
+                            else:
+                                st.caption("No analyzed data available (legacy query)")
+                        
+                        # Error section
                         if detail.get("error"):
                             st.markdown("### ❌ Error")
                             st.error(detail["error"])

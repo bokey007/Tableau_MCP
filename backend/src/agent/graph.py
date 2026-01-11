@@ -5,19 +5,26 @@
 
 import json
 import re
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict, Annotated
+from operator import add
 
 import pandas as pd
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.core.config import settings
 from src.core.exceptions import ValidationError
 from src.core.logging import get_logger
 from src.mcp.client import MCPClient
 from src.mcp.models import Datasource, DatasourceMetadata, QueryResult
+
+# Enterprise features
+from src.agent.phi_sanitizer import PHISanitizer, sanitize_for_llm
+from src.agent.data_dictionary import DataDictionary, get_data_dictionary
+from src.agent.query_decomposer import QueryDecomposer, get_query_decomposer
 
 logger = get_logger(__name__)
 
@@ -27,18 +34,29 @@ logger = get_logger(__name__)
 # =============================================================================
 
 class AgentState(TypedDict, total=False):
-    """State for the agent graph."""
+    """State for the agent graph with LangGraph native memory."""
+    # Conversation messages (LangGraph native - automatically persisted)
+    messages: Annotated[List[BaseMessage], add]  # Appends messages automatically
+    
+    # Core query fields
     question: str
     selected_datasource: Optional[Datasource]
     datasources: List[Datasource]
     metadata: Optional[DatasourceMetadata]
+    metadata_id: Optional[str]  # helper to track which datasource the metadata is for
+    sample_data: List[Dict[str, Any]]  # sample rows for LLM context (PHI sanitized)
     plan: Dict[str, Any]
-    query: Dict[str, Any]
+    query: Dict[str, Any]  # legacy/internal
+    vizql_query: Dict[str, Any]  # strict vizql
     query_result: Optional[QueryResult]
+    analyzed_data: Dict[str, Any]  # what the LLM actually analyzed (for validation)
     analysis: str
     visualization: Dict[str, Any]
     status: str
     error: Optional[str]
+    # Review workflow
+    critique: Optional[str]
+    retry_count: int
 
 
 # =============================================================================
@@ -48,6 +66,12 @@ class AgentState(TypedDict, total=False):
 SYSTEM_PROMPT = """You are an expert Tableau data analyst AI assistant. Your role is to help users 
 analyze data from Tableau datasources by understanding their questions, constructing appropriate 
 VizQL queries, and providing insightful analysis of the results.
+
+## Conversation Support:
+- You maintain context across multiple turns in a conversation
+- For follow-up questions like "what about by region?" or "show me the top 10", refer to the previous query context
+- When users say "that", "those", "it", etc., understand they refer to the previous result
+- If a question is ambiguous, use conversation history to infer intent
 
 ## VizQL Query Structure:
 {
@@ -60,7 +84,7 @@ VizQL queries, and providing insightful analysis of the results.
   ]
 }
 
-Be precise, analytical, and helpful."""
+Be precise, analytical, and helpful. Reference previous conversation when relevant."""
 
 
 QUERY_BUILDER_PROMPT = """Build a VizQL query to answer this question: {question}
@@ -68,31 +92,160 @@ QUERY_BUILDER_PROMPT = """Build a VizQL query to answer this question: {question
 Available fields in the datasource:
 {fields}
 
-CRITICAL RULES - Follow exactly:
+{feedback_section}
+
+== CRITICAL RULES ==
 1. Use EXACT field names from the list above (case-sensitive)
-2. For measures (numeric values), ALWAYS include "function": "SUM" (or "AVG", "COUNT", "MIN", "MAX" as appropriate)
-3. For dimensions (categories, dates), do NOT include a function
-4. The query aggregates data: measures are summed/averaged BY dimensions
-5. Include "sortDirection": "DESC" or "ASC" inside the measure field if ordering is needed
-6. ONLY use "fields" key - do NOT use "filters", "sort", or "limit" (filtering will be done after query)
-7. For time-based questions (last year, this month, etc.), include the date field and filter in Python later
+2. For measures (numeric values), ALWAYS include "function": "SUM" (or AVG, COUNT, COUNTD, MIN, MAX, MEDIAN)
+3. For dimensions (categories, names), do NOT include a function
+4. Use "sortDirection": "DESC" or "ASC" inside fields for ordering
+5. Use "sortPriority": 1, 2, 3... when sorting multiple fields
+6. Use "fieldAlias" to give meaningful names to calculated results
 
-Example for "sales by year":
+== FIELD OPTIONS ==
+
+**Basic Field**: {{"fieldCaption": "Customer Name"}}
+
+**Aggregated Field**: {{"fieldCaption": "Sales", "function": "SUM", "maxDecimalPlaces": 2}}
+
+**Aliased Field**: {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total Revenue"}}
+
+**Calculated Field** (for ratios, growth, custom metrics):
+{{"fieldCaption": "Profit Margin", "calculation": "SUM([Profit])/SUM([Sales])", "maxDecimalPlaces": 2}}
+{{"fieldCaption": "YoY Growth", "calculation": "(SUM([Sales]) - SUM([Previous Year Sales]))/SUM([Previous Year Sales])"}}
+
+**Date Aggregations**:
+- YEAR, QUARTER, MONTH, WEEK, DAY - extract part of date
+- TRUNC_YEAR, TRUNC_MONTH, TRUNC_DAY - truncate to period
+Example: {{"fieldCaption": "Order Date", "function": "YEAR", "fieldAlias": "Order Year"}}
+
+== FILTER TYPES ==
+
+**1. TOP N FILTER** (for "top 5", "bottom 10"):
+{{"field": {{"fieldCaption": "Customer Name"}}, "filterType": "TOP", "howMany": 5, "direction": "TOP", "fieldToMeasure": {{"fieldCaption": "Sales", "function": "SUM"}}}}
+
+**2. QUANTITATIVE FILTER** (for "> 10000", "< 500", "between"):
+{{"field": {{"fieldCaption": "Sales", "function": "SUM"}}, "filterType": "QUANTITATIVE_NUMERICAL", "quantitativeFilterType": "MIN", "min": 10000}}
+- quantitativeFilterType: MIN (>), MAX (<), RANGE (between), ONLY_NULL, ONLY_NON_NULL
+
+**3. SET FILTER** (include/exclude specific values):
+{{"field": {{"fieldCaption": "Region"}}, "filterType": "SET", "values": ["West", "East"], "exclude": false}}
+
+**4. DATE FILTER** (relative dates):
+{{"field": {{"fieldCaption": "Order Date"}}, "filterType": "DATE", "periodType": "YEARS", "dateRangeType": "LAST"}}
+- periodType: DAYS, WEEKS, MONTHS, QUARTERS, YEARS
+- dateRangeType: LAST, CURRENT, NEXT, LASTN (+ rangeN), NEXTN (+ rangeN), TODATE
+
+**5. DATE RANGE FILTER** (specific date range):
+{{"field": {{"fieldCaption": "Order Date"}}, "filterType": "QUANTITATIVE_DATE", "quantitativeFilterType": "RANGE", "minDate": "2024-01-01", "maxDate": "2024-12-31"}}
+
+**6. MATCH FILTER** (pattern matching):
+{{"field": {{"fieldCaption": "Product Name"}}, "filterType": "MATCH", "contains": "Chair", "exclude": false}}
+- Options: startsWith, endsWith, contains
+
+**7. CONTEXT FILTER** (scope other filters - add "context": true):
+{{"field": {{"fieldCaption": "Category"}}, "filterType": "SET", "values": ["Furniture"], "exclude": false, "context": true}}
+
+== COMPLEX EXAMPLES ==
+
+Q: "Top 5 customers by sales in West region"
 {{
   "fields": [
-    {{"fieldCaption": "Order Date"}},
+    {{"fieldCaption": "Customer Name"}},
+    {{"fieldCaption": "Sales", "function": "SUM", "sortDirection": "DESC", "sortPriority": 1}}
+  ],
+  "filters": [
+    {{"field": {{"fieldCaption": "Region"}}, "filterType": "SET", "values": ["West"], "exclude": false, "context": true}},
+    {{"field": {{"fieldCaption": "Customer Name"}}, "filterType": "TOP", "howMany": 5, "direction": "TOP", "fieldToMeasure": {{"fieldCaption": "Sales", "function": "SUM"}}}}
+  ]
+}}
+
+Q: "Profit margin by category for products with sales > $50000"
+{{
+  "fields": [
+    {{"fieldCaption": "Category"}},
+    {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total Sales"}},
+    {{"fieldCaption": "Profit", "function": "SUM", "fieldAlias": "Total Profit"}},
+    {{"fieldCaption": "Profit Margin", "calculation": "SUM([Profit])/SUM([Sales])", "maxDecimalPlaces": 2}}
+  ],
+  "filters": [
+    {{"field": {{"fieldCaption": "Sales", "function": "SUM"}}, "filterType": "QUANTITATIVE_NUMERICAL", "quantitativeFilterType": "MIN", "min": 50000}}
+  ]
+}}
+
+Q: "Monthly sales trend for last 12 months"
+{{
+  "fields": [
+    {{"fieldCaption": "Order Date", "function": "TRUNC_MONTH", "fieldAlias": "Month", "sortPriority": 1}},
+    {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Monthly Sales"}}
+  ],
+  "filters": [
+    {{"field": {{"fieldCaption": "Order Date"}}, "filterType": "DATE", "periodType": "MONTHS", "dateRangeType": "LASTN", "rangeN": 12}}
+  ]
+}}
+
+Q: "Compare Furniture vs Technology sales by region"
+{{
+  "fields": [
+    {{"fieldCaption": "Region"}},
+    {{"fieldCaption": "Category"}},
     {{"fieldCaption": "Sales", "function": "SUM", "sortDirection": "DESC"}}
+  ],
+  "filters": [
+    {{"field": {{"fieldCaption": "Category"}}, "filterType": "SET", "values": ["Furniture", "Technology"], "exclude": false}}
   ]
 }}
 
-Example for "total profit" (just get all profit data):
-{{
-  "fields": [
-    {{"fieldCaption": "Profit", "function": "SUM"}}
-  ]
-}}
+Return ONLY a valid JSON object. No explanation, no markdown."""
 
-Return ONLY a valid JSON object with "fields" array. No filters, no explanation, no markdown."""
+
+QUERY_REVIEW_PROMPT = """You are a Senior QA Engineer validating a VizQL query against the user's question and schema.
+
+Question: {question}
+
+Query Generated:
+{query}
+
+Schema Valid Fields:
+{fields}
+
+== VALIDATION CHECKS ==
+
+1. **Field Validity**: Are all fieldCaption values actually in the schema?
+   - Exception: Calculated fields can have any fieldCaption if they have a "calculation" property
+
+2. **Logic Check**: Does the query actually answer the question?
+
+3. **Aggregation**: Are measures aggregated correctly (SUM, AVG, COUNT, COUNTD, MIN, MAX, MEDIAN)?
+
+4. **Calculated Fields** (if present):
+   - Must have "calculation" property with valid Tableau syntax
+   - Field references in calculation must exist in schema: e.g., "[Sales]", "[Profit]"
+   - Must have "fieldCaption" for the result name
+
+5. **Filter Syntax** (if filters present):
+   - TOP filter: "field", "filterType": "TOP", "howMany", "direction", "fieldToMeasure"
+   - QUANTITATIVE_NUMERICAL: "field", "filterType", "quantitativeFilterType", "min"/"max"
+   - SET filter: "field", "filterType": "SET", "values" array, "exclude" boolean
+   - DATE filter: "field", "filterType": "DATE", "periodType", "dateRangeType"
+   - QUANTITATIVE_DATE: "field", "filterType", "quantitativeFilterType", "minDate"/"maxDate"
+   - MATCH filter: "field", "filterType": "MATCH", at least one of "startsWith"/"endsWith"/"contains"
+   - Context filters: "context": true scopes subsequent filters
+
+6. **Question Match**: 
+   - If question asks for "top N", is there a TOP filter with correct howMany?
+   - If question mentions specific values (e.g., "West region"), is there a SET filter?
+   - If question mentions time period, is there a DATE filter?
+
+If the query is GOOD, return exactly: "APPROVED"
+If the query is BAD, return a concise critique explaining EXACTLY what to fix.
+
+Example Critiques:
+- "Field 'Total Sales' does not exist. Use 'Sales' instead."
+- "TOP filter missing fieldToMeasure. Add fieldToMeasure with the measure field."
+- "Question asks for 'West region' but no SET filter for Region. Add filter."
+- "Calculation references [Revenue] but field is called 'Sales'. Fix to [Sales]."
+"""
 
 
 ANALYZER_PROMPT = """Analyze these query results to answer: {question}
@@ -114,7 +267,10 @@ Be concise but thorough."""
 # =============================================================================
 
 class TableauAgent:
-    """LangGraph-based agent for Tableau data analysis."""
+    """LangGraph-based agent for Tableau data analysis with native memory."""
+    
+    # Class-level checkpointer (shared across instances for persistence)
+    _checkpointer = None
     
     def __init__(self, mcp_client: Optional[MCPClient] = None):
         """
@@ -126,6 +282,16 @@ class TableauAgent:
         self.mcp_client = mcp_client or MCPClient()
         self._llm: Optional[ChatOpenAI] = None
         self._compiled_graph = None
+    
+    @classmethod
+    def get_checkpointer(cls) -> MemorySaver:
+        """Get or create the shared checkpointer instance."""
+        if cls._checkpointer is None:
+            # Use MemorySaver for now (can switch to PostgresSaver for full persistence)
+            # For PostgresSaver: from langgraph.checkpoint.postgres import PostgresSaver
+            cls._checkpointer = MemorySaver()
+            logger.info("Initialized LangGraph MemorySaver checkpointer")
+        return cls._checkpointer
     
     @property
     def llm(self) -> ChatOpenAI:
@@ -155,16 +321,20 @@ class TableauAgent:
         # Add nodes
         graph.add_node("discover", self._discover_datasources)
         graph.add_node("plan", self._plan_query)
+        graph.add_node("review", self._review_query)
         graph.add_node("execute", self._execute_query)
         graph.add_node("analyze", self._analyze_results)
         
         # Define edges
         graph.set_entry_point("discover")
         graph.add_edge("discover", "plan")
+        graph.add_edge("plan", "review")
+        
         graph.add_conditional_edges(
-            "plan",
-            self._should_execute,
+            "review",
+            self._check_review_outcome,
         )
+        
         graph.add_conditional_edges(
             "execute",
             self._should_analyze,
@@ -173,10 +343,14 @@ class TableauAgent:
         
         return graph
     
-    def _should_execute(self, state: AgentState) -> str:
-        """Determine if we should execute or end."""
+    def _check_review_outcome(self, state: AgentState) -> str:
+        """Determine next step based on critique."""
         if state.get("error"):
             return END
+        if state.get("critique") and state.get("critique") != "APPROVED":
+            # If critique exists and we haven't retried too much, go back to plan
+            if state.get("retry_count", 0) < 3:
+                return "plan"
         return "execute"
     
     def _should_analyze(self, state: AgentState) -> str:
@@ -187,14 +361,26 @@ class TableauAgent:
     
     @property
     def graph(self):
-        """Get compiled graph."""
+        """Get compiled graph with checkpointer for conversation memory."""
         if self._compiled_graph is None:
-            self._compiled_graph = self._build_graph().compile()
+            checkpointer = self.get_checkpointer()
+            self._compiled_graph = self._build_graph().compile(checkpointer=checkpointer)
+            logger.info("Compiled graph with LangGraph checkpointer")
         return self._compiled_graph
+        
+    async def get_state(self, thread_id: str) -> Dict[str, Any]:
+        """Get the current state for a thread."""
+        config = {"configurable": {"thread_id": thread_id}}
+        state_values = await self.graph.aget_state(config)
+        return state_values.values if state_values else {}
     
     async def _discover_datasources(self, state: AgentState) -> AgentState:
         """Discover available datasources."""
         logger.info("Discovering datasources")
+        
+        # Initialize retry count
+        state["retry_count"] = 0
+        state["critique"] = None
         
         try:
             datasources = await self.mcp_client.list_datasources()
@@ -224,8 +410,13 @@ class TableauAgent:
         """Plan and select datasource."""
         question = state.get("question", "")
         datasources = state.get("datasources", [])
+        critique = state.get("critique")
         
-        logger.info("Planning query", question=question[:50])
+        logger.info("Planning query", question=question[:50], critique=critique)
+        
+        if critique and critique != "APPROVED":
+            state["retry_count"] = state.get("retry_count", 0) + 1
+            logger.info("Refining query based on critique", attempt=state["retry_count"])
         
         # Select datasource if not selected
         if not state.get("selected_datasource") and datasources:
@@ -259,35 +450,156 @@ class TableauAgent:
                     logger.error("Datasource selection failed", error=str(e))
                     state["selected_datasource"] = datasources[0]
         
-        # Get metadata
-        if state.get("selected_datasource") and not state.get("metadata"):
+        if not state.get("selected_datasource"):
+            state["error"] = "No datasource selected"
+            return state
+            
+        # Get metadata if needed
+        ds = state["selected_datasource"]
+        if "metadata" not in state or state.get("metadata_id") != ds.id:
             try:
-                metadata = await self.mcp_client.get_datasource_metadata(
-                    state["selected_datasource"].id
-                )
+                metadata = await self.mcp_client.get_datasource_metadata(ds.id)
                 state["metadata"] = metadata
-                logger.info(
-                    "Got metadata", 
-                    datasource=state["selected_datasource"].name,
-                    fields=len(metadata.fields)
-                )
+                state["metadata_id"] = ds.id
+                logger.info("Got metadata", datasource=ds.name, fields=len(metadata.fields))
             except Exception as e:
-                logger.error("Failed to get metadata", error=str(e))
-                state["error"] = f"Failed to get datasource schema: {e}"
+                state["error"] = f"Failed to get metadata: {e}"
                 return state
         
-        state["plan"] = {
-            "datasource_id": state["selected_datasource"].id if state.get("selected_datasource") else None,
-            "datasource_name": state["selected_datasource"].name if state.get("selected_datasource") else None,
-        }
-        state["status"] = "planned"
+        # Generate schema description
+        fields_str = state["metadata"].to_schema_description()
         
+        # Optional: Enrich with data dictionary if available
+        data_dict = get_data_dictionary()
+        if data_dict and not data_dict.is_empty():
+            fields_str = data_dict.enrich_schema(fields_str)
+            logger.info("Enriched schema with data dictionary")
+        
+        # Fetch sample data for better LLM context (CRITICAL for accuracy)
+        sample_data_section = ""
+        if "sample_data" not in state:
+            try:
+                sample_rows = await self.mcp_client.get_sample_data(ds.id, num_rows=5)
+                if sample_rows:
+                    # Apply PHI sanitization before including in prompt
+                    sanitized = sanitize_for_llm(sample_rows)
+                    state["sample_data"] = sanitized.sanitized_data
+                    
+                    if sanitized.phi_detected:
+                        logger.warning(
+                            "PHI detected in sample data and sanitized",
+                            phi_fields=sanitized.phi_fields,
+                            count=sanitized.phi_count
+                        )
+                    
+                    # Format sample data for prompt
+                    if sanitized.sanitized_data:
+                        sample_lines = ["Sample Data (first 5 rows):"]
+                        headers = list(sanitized.sanitized_data[0].keys())
+                        sample_lines.append("| " + " | ".join(headers) + " |")
+                        sample_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                        for row in sanitized.sanitized_data[:5]:
+                            values = [str(row.get(h, ""))[:30] for h in headers]  # Truncate long values
+                            sample_lines.append("| " + " | ".join(values) + " |")
+                        sample_data_section = "\n".join(sample_lines)
+                    
+            except Exception as e:
+                logger.warning(f"Could not fetch sample data: {e}")
+                state["sample_data"] = []
+        else:
+            # Reuse cached sample data
+            if state.get("sample_data"):
+                sample_lines = ["Sample Data (first 5 rows):"]
+                headers = list(state["sample_data"][0].keys())
+                sample_lines.append("| " + " | ".join(headers) + " |")
+                sample_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                for row in state["sample_data"][:5]:
+                    values = [str(row.get(h, ""))[:30] for h in headers]
+                    sample_lines.append("| " + " | ".join(values) + " |")
+                sample_data_section = "\n".join(sample_lines)
+        
+        # Add feedback to prompt if retrying
+        feedback_section = ""
+        if critique and critique != "APPROVED":
+            feedback_section = f"\nPREVIOUS ATTEMPT CRITIQUE (FIX THIS): \n{critique}\n"
+        
+        # Build the full prompt with sample data
+        full_fields_context = fields_str
+        if sample_data_section:
+            full_fields_context += f"\n\n{sample_data_section}"
+        
+        prompt = QUERY_BUILDER_PROMPT.format(
+            question=question,
+            fields=full_fields_context,
+            feedback_section=feedback_section
+        )
+
+        try:
+            response = await self.llm.ainvoke(prompt)
+            # Parse JSON from response
+            content = response.content.strip()
+            # Remove markdown code blocks if present
+            if "```" in content:
+                content = content.replace("```json", "").replace("```", "")
+            
+            try:
+                query = json.loads(content)
+                state["vizql_query"] = query
+                logger.info("Generated VizQL query", query=query)
+            except json.JSONDecodeError:
+                 state["error"] = "Failed to parse generated query JSON"
+        except Exception as e:
+            if not critique: # Only fail if it's the first try, otherwise let loop handle error
+                 state["error"] = f"Query generation failed: {e}"
+            else:
+                 logger.error("Retry failed", error=str(e))
+        
+        return state
+
+    async def _review_query(self, state: AgentState) -> AgentState:
+        """Review the generated query for correctness."""
+        query = state.get("vizql_query")
+        metadata = state.get("metadata")
+        question = state.get("question")
+        
+        if not query or not metadata:
+            state["critique"] = "Missing query or metadata"
+            return state
+            
+        logger.info("Reviewing query")
+        
+        fields_str = metadata.to_schema_description()
+        query_str = json.dumps(query, indent=2)
+        
+        prompt = QUERY_REVIEW_PROMPT.format(
+            question=question,
+            query=query_str,
+            fields=fields_str
+        )
+        
+        try:
+            response = await self.llm.ainvoke(prompt)
+            critique = response.content.strip()
+            
+            # Simple heuristic: If it doesn't say "APPROVED", treat as critique
+            if "APPROVED" in critique.upper() and len(critique) < 20:
+                logger.info("Query APPROVED")
+                state["critique"] = "APPROVED"
+            else:
+                logger.info("Query REJECTED", critique=critique)
+                state["critique"] = critique
+                
+        except Exception as e:
+            logger.error("Review failed, skipping", error=str(e))
+            state["critique"] = "APPROVED" # specific failure shouldn't block execution
+            
         return state
     
     async def _execute_query(self, state: AgentState) -> AgentState:
-        """Build and execute the VizQL query."""
+        """Execute the VizQL query."""
         question = state.get("question", "")
         metadata = state.get("metadata")
+        query = state.get("vizql_query")
         
         logger.info("Executing query")
         
@@ -295,47 +607,10 @@ class TableauAgent:
             state["error"] = "No datasource metadata available"
             return state
         
-        if not metadata.fields:
-            state["error"] = "Datasource has no queryable fields"
-            return state
-        
-        # Build query using LLM
-        prompt = QUERY_BUILDER_PROMPT.format(
-            question=question,
-            fields=metadata.to_schema_description(),
-        )
-        
-        try:
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are a VizQL query builder. Return ONLY valid JSON, no explanation or markdown."),
-                HumanMessage(content=prompt),
-            ])
-            
-            # Parse query
-            query = self._extract_json(response.content)
-            
-            if not query:
-                logger.error("Failed to parse query", response=response.content[:200])
-                state["error"] = "Failed to generate valid query"
-                return state
-            
-            # Validate query structure
-            if "fields" not in query or not query["fields"]:
-                state["error"] = "Generated query is missing fields"
-                return state
-            
-            state["query"] = query
-            logger.info(
-                "Generated VizQL query",
-                fields=len(query.get("fields", [])),
-                query=query,  # Log the full query for debugging
-            )
-            
-        except Exception as e:
-            logger.error("Query generation failed", error=str(e))
-            state["error"] = f"Failed to generate query: {e}"
-            return state
-        
+        if not query:
+             state["error"] = "No VizQL query available to execute"
+             return state
+
         # Execute query
         try:
             result = await self.mcp_client.query_datasource(
@@ -343,13 +618,12 @@ class TableauAgent:
                 query=query,
             )
             state["query_result"] = result
-            state["status"] = "executed"
-            logger.info("Query executed", rows=result.row_count)
+            logger.info("Query executed successfully", rows=len(result.data))
             
         except Exception as e:
             logger.error("Query execution failed", error=str(e))
             state["error"] = f"Query execution failed: {e}"
-        
+            
         return state
     
     async def _analyze_results(self, state: AgentState) -> AgentState:
@@ -375,6 +649,14 @@ class TableauAgent:
             # Prepare data for LLM (aggregated or sampled)
             # This does NOT modify the actual result.data
             llm_df = self._prepare_data_for_llm(df.copy(), question)
+            
+            # Store the analyzed data for validation purposes
+            state["analyzed_data"] = {
+                "row_count": len(llm_df),
+                "original_row_count": total_rows,
+                "data": llm_df.to_dict(orient="records"),
+                "description": f"Aggregated from {total_rows} to {len(llm_df)} rows based on question type"
+            }
             
             # Convert to markdown for LLM
             MAX_ROWS_FOR_LLM = 50
@@ -438,7 +720,6 @@ Available calculator tools:
             
             # Handle tool calls if any
             if hasattr(response, 'tool_calls') and response.tool_calls:
-                from langchain_core.messages import AIMessage, ToolMessage
                 
                 # Execute each tool call
                 tool_results = []
@@ -481,6 +762,9 @@ Available calculator tools:
         state["visualization"] = self._recommend_visualization(result)
         state["status"] = "complete"
         
+        # Add assistant response to conversation history (LangGraph native)
+        state["messages"] = [AIMessage(content=state.get("analysis", ""))]
+        
         return state
     
     def _prepare_data_for_llm(self, df: pd.DataFrame, question: str) -> pd.DataFrame:
@@ -491,13 +775,43 @@ Available calculator tools:
         return self._pre_aggregate_data(df, question)
     
     def _pre_aggregate_data(self, df: pd.DataFrame, question: str) -> pd.DataFrame:
-        """Pre-aggregate data based on the question to avoid LLM calculation errors."""
+        """
+        Pre-aggregate data based on the question to ensure accurate LLM analysis.
+        
+        This is a FALLBACK mechanism. If VDS filters worked correctly, the data
+        should already be filtered. This catches cases where:
+        1. VDS filters failed or weren't applied
+        2. Complex filtering not supported by VDS
+        3. Post-processing aggregation is needed
+        """
         import pandas as pd
         import re
         from datetime import datetime, timedelta
         
         question_lower = question.lower()
         original_row_count = len(df)
+        
+        # ========================================
+        # Check if VDS already filtered appropriately
+        # ========================================
+        top_n_match = re.search(r'\b(?:top|bottom)\s+(\d+)\b', question_lower)
+        if top_n_match:
+            expected_n = int(top_n_match.group(1))
+            # If we got roughly the right number of rows, VDS filtering worked
+            if len(df) <= expected_n * 2:  # Allow some buffer
+                logger.info(
+                    "VDS filtering appears to have worked",
+                    expected=expected_n,
+                    got=len(df)
+                )
+                return df  # Data already filtered by VDS
+        
+        # ========================================
+        # If data is small enough, no aggregation needed
+        # ========================================
+        if len(df) <= 50:
+            logger.info("Data small enough for direct analysis", rows=len(df))
+            return df
         
         # Detect date columns
         date_cols = []
@@ -556,25 +870,88 @@ Available calculator tools:
                 logger.info(f"Filtered to year {target_year}", rows_after=len(df))
         
         # ========================================
-        # 1. Handle "top N" / "bottom N" requests
+        # 1. Handle "top N" / "bottom N" requests with optional value filters
         # ========================================
-        top_n_match = re.search(r'\b(top|bottom|first|last)\s*(\d+)\b', question_lower)
+        top_n_match = re.search(r'\b(top|bottom|first|last|highest|lowest)\s*(\d+)\b', question_lower)
         if top_n_match:
             direction = top_n_match.group(1)
             n = int(top_n_match.group(2))
+            ascending = direction in ['bottom', 'last', 'lowest']
             
-            if numeric_cols:
+            logger.info(f"Detected Top N request", direction=direction, n=n)
+            
+            # Detect value filter (e.g., "> $10000", "above 5000", "more than 1000")
+            value_filter_match = re.search(
+                r'(?:>|greater than|above|more than|over|exceeding)\s*\$?\s*([\d,]+)', 
+                question_lower
+            )
+            min_value = None
+            if value_filter_match:
+                min_value = float(value_filter_match.group(1).replace(',', ''))
+                logger.info(f"Detected value filter: > {min_value}")
+            
+            value_filter_max_match = re.search(
+                r'(?:<|less than|below|under)\s*\$?\s*([\d,]+)', 
+                question_lower
+            )
+            max_value = None
+            if value_filter_max_match:
+                max_value = float(value_filter_max_match.group(1).replace(',', ''))
+                logger.info(f"Detected value filter: < {max_value}")
+            
+            # Determine which column to aggregate/sort on
+            # Look for keywords like "by sales", "by profit", "by revenue"
+            sort_col = None
+            for col in numeric_cols:
+                col_lower = col.lower()
+                # Check if this column is mentioned in the question
+                if any(word in question_lower for word in [col_lower, col_lower.replace('sum(', '').replace(')', '')]):
+                    sort_col = col
+                    break
+            
+            # Default to first numeric column if not found
+            if not sort_col and numeric_cols:
                 sort_col = numeric_cols[0]
-                ascending = direction in ['bottom', 'last']
-                
-                # If there are duplicates in the dimension, aggregate first
-                if string_cols and df[string_cols[0]].duplicated().any():
-                    agg_dict = {col: 'sum' for col in numeric_cols}
-                    df = df.groupby(string_cols[0]).agg(agg_dict).reset_index()
-                
-                result = df.sort_values(sort_col, ascending=ascending).head(n)
-                logger.info(f"Extracted {direction} {n}", rows=len(result))
-                return result
+            
+            if not sort_col:
+                logger.warning("No numeric column found for Top N sorting")
+                return df
+            
+            # Determine the dimension column (customer, product, etc.)
+            dimension_col = None
+            for keyword in ['customer', 'product', 'category', 'region', 'city', 'state', 'segment', 'name']:
+                for col in string_cols:
+                    if keyword in col.lower():
+                        dimension_col = col
+                        break
+                if dimension_col:
+                    break
+            
+            # If no specific dimension found, use first string column
+            if not dimension_col and string_cols:
+                dimension_col = string_cols[0]
+            
+            # CRITICAL: Aggregate by dimension first (sum all values for each customer/entity)
+            if dimension_col:
+                logger.info(f"Aggregating by dimension: {dimension_col}")
+                agg_dict = {col: 'sum' for col in numeric_cols}
+                df = df.groupby(dimension_col).agg(agg_dict).reset_index()
+            
+            # Apply value filter AFTER aggregation
+            if min_value is not None:
+                before_count = len(df)
+                df = df[df[sort_col] > min_value]
+                logger.info(f"Applied filter > {min_value}", before=before_count, after=len(df))
+            
+            if max_value is not None:
+                before_count = len(df)
+                df = df[df[sort_col] < max_value]
+                logger.info(f"Applied filter < {max_value}", before=before_count, after=len(df))
+            
+            # Sort and take top N
+            result = df.sort_values(sort_col, ascending=ascending).head(n)
+            logger.info(f"Extracted {direction} {n}", sort_col=sort_col, rows=len(result))
+            return result
         
         # ========================================
         # 2. Date-based aggregations
@@ -770,6 +1147,7 @@ Available calculator tools:
         self,
         question: str,
         datasource_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Answer a question about Tableau data.
@@ -777,6 +1155,7 @@ Available calculator tools:
         Args:
             question: Natural language question
             datasource_id: Optional datasource ID to use
+            thread_id: Thread ID for LangGraph conversation memory
             
         Returns:
             Result dictionary with analysis and data
@@ -788,9 +1167,11 @@ Available calculator tools:
                 "error": "Question is too short",
             }
         
+        # Build initial state with user message
         initial_state: AgentState = {
             "question": question.strip(),
             "status": "started",
+            "messages": [HumanMessage(content=question.strip())],  # LangGraph native
         }
         
         if datasource_id:
@@ -799,31 +1180,64 @@ Available calculator tools:
                 name=datasource_id,
             )
         
+        # Configure thread for conversation memory
+        config = {}
+        if thread_id:
+            config = {"configurable": {"thread_id": thread_id}}
+            logger.info("Using LangGraph thread", thread_id=thread_id)
+        
         try:
-            final_state = await self.graph.ainvoke(initial_state)
+            final_state = await self.graph.ainvoke(initial_state, config=config)
             
             result_data = None
+            analyzed_data = None
+            
             if final_state.get("query_result"):
                 qr = final_state["query_result"]
                 result_data = {
                     "row_count": qr.row_count,
-                    "data": qr.data[:100],  # Limit to 100 rows
+                    "data": qr.data,  # Return ALL data for validation (no limit)
                     "execution_time_ms": qr.execution_time_ms,
                 }
+                
+                # Include what the LLM actually analyzed (for validation)
             
-            return {
+            # Debug: Log available keys in final_state
+            logger.info("Final state keys", keys=list(final_state.keys()))
+            
+            if final_state.get("analyzed_data"):
+                analyzed_data = final_state["analyzed_data"]
+                logger.info("Analyzed data found", rows=analyzed_data.get("row_count"))
+            else:
+                logger.warning("No analyzed_data in final_state")
+            
+            # Build result
+            result = {
                 "success": final_state.get("status") == "complete" and not final_state.get("error"),
                 "question": question,
+                "thread_id": thread_id,  # Return thread_id for frontend
                 "datasource": {
                     "id": final_state.get("selected_datasource").id,
                     "name": final_state.get("selected_datasource").name,
                 } if final_state.get("selected_datasource") else None,
                 "analysis": final_state.get("analysis"),
-                "query": final_state.get("query"),
+                "query": final_state.get("vizql_query"),  # Return the VizQL query
                 "results": result_data,
+                "analyzed_data": analyzed_data,  # Data the LLM actually analyzed
                 "visualization": final_state.get("visualization"),
                 "error": final_state.get("error"),
+                "message_count": len(final_state.get("messages", [])),  # Conversation length
             }
+            
+            # LangGraph checkpointer automatically persists state with thread_id
+            if thread_id and result["success"]:
+                logger.info(
+                    "Conversation persisted via LangGraph checkpointer",
+                    thread_id=thread_id,
+                    messages=len(final_state.get("messages", []))
+                )
+            
+            return result
             
         except Exception as e:
             logger.exception("Agent execution failed", error=str(e))

@@ -66,6 +66,7 @@ class QueryService:
         generated_query: Optional[Dict[str, Any]] = None,
         response_text: Optional[str] = None,
         response_data: Optional[Dict[str, Any]] = None,
+        analyzed_data: Optional[Dict[str, Any]] = None,
         visualization_config: Optional[Dict[str, Any]] = None,
         execution_time_ms: Optional[float] = None,
         row_count: Optional[int] = None,
@@ -79,7 +80,8 @@ class QueryService:
             status: New status
             generated_query: VizQL query used
             response_text: AI-generated response
-            response_data: Query result data
+            response_data: Query result data (raw/limited)
+            analyzed_data: What LLM actually analyzed (for debugging)
             visualization_config: Chart configuration
             execution_time_ms: Execution time
             row_count: Number of rows
@@ -98,6 +100,7 @@ class QueryService:
         query.generated_query = generated_query
         query.response_text = response_text
         query.response_data = response_data
+        query.analyzed_data = analyzed_data
         query.visualization_config = visualization_config
         query.execution_time_ms = execution_time_ms
         query.row_count = row_count

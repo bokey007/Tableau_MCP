@@ -64,6 +64,12 @@ if "feedback_given" not in st.session_state:
     st.session_state.feedback_given = False
 if "selected_datasource" not in st.session_state:
     st.session_state.selected_datasource = None
+# LangGraph conversation thread
+if "thread_id" not in st.session_state:
+    import uuid
+    st.session_state.thread_id = str(uuid.uuid4())
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # Chat history for display
 
 
 # =============================================================================
@@ -110,6 +116,21 @@ with st.sidebar:
     else:
         st.error("❌ Backend Unavailable")
         st.caption(health.get("error", "Check if backend is running"))
+    
+    st.divider()
+    
+    # Conversation controls
+    st.subheader("💬 Conversation")
+    st.caption(f"Thread: `{st.session_state.thread_id[:8]}...`")
+    st.caption(f"Messages: {len(st.session_state.messages)}")
+    
+    if st.button("🔄 New Conversation", use_container_width=True):
+        import uuid
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.session_state.current_result = None
+        st.session_state.feedback_given = False
+        st.rerun()
     
     st.divider()
     
@@ -201,23 +222,66 @@ if submit and question:
     else:
         st.session_state.feedback_given = False
         
+        # Add user message to chat history
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question,
+            "timestamp": datetime.now().isoformat(),
+        })
+        
         with st.spinner("🤖 Analyzing your question..."):
             result = api.query(
                 question=question,
                 datasource_id=selected_datasource_id,
                 username=st.session_state.username,
+                thread_id=st.session_state.thread_id,  # LangGraph native memory
             )
             
             st.session_state.current_result = result
             st.session_state.current_query_id = result.get("query_id")
             
-            # Add to local history
+            # Add assistant message to chat history
+            if result.get("success"):
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": result.get("analysis", "No analysis available"),
+                    "timestamp": datetime.now().isoformat(),
+                    "query_id": result.get("query_id"),
+                    "has_data": bool(result.get("results")),
+                })
+            else:
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"❌ Error: {result.get('error', 'Unknown error')}",
+                    "timestamp": datetime.now().isoformat(),
+                    "is_error": True,
+                })
+            
+            # Add to local history (for sidebar)
             st.session_state.query_history.insert(0, {
                 "question": question,
                 "query_id": result.get("query_id"),
                 "success": result.get("success"),
                 "timestamp": datetime.now().isoformat(),
             })
+
+# Display conversation history (show all but latest exchange)
+if len(st.session_state.messages) > 2:
+    st.divider()
+    st.subheader("💬 Conversation History")
+    
+    # Show previous messages (excluding the latest pair)
+    for i, msg in enumerate(st.session_state.messages[:-2]):
+        if msg["role"] == "user":
+            st.markdown(f"**🧑 You:** {msg['content']}")
+        else:
+            # Truncate long assistant messages
+            content = msg['content']
+            if len(content) > 300:
+                content = content[:300] + "..."
+            st.markdown(f"**🤖 Assistant:** {content}")
+    
+    st.caption(f"Showing {len(st.session_state.messages) - 2} previous messages")
 
 # Display results
 if st.session_state.current_result:
@@ -391,6 +455,43 @@ if st.session_state.current_result:
                     st.info(f"📊 Recommended: {chart_type.title()} chart | X: {x_axis} | Y: {y_axis}")
             else:
                 st.info(f"📊 Recommended: {viz.get('chart_type', 'table').title()} chart")
+        
+        # Debug Panel (collapsible)
+        with st.expander("🔧 Debug Information", expanded=False):
+            st.markdown("#### Generated VizQL Query")
+            if result.get("query"):
+                import json
+                st.code(json.dumps(result["query"], indent=2), language="json")
+            else:
+                st.caption("No query generated")
+            
+            st.markdown("#### Data Analysis Details")
+            if result.get("analyzed_data"):
+                analyzed = result["analyzed_data"]
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Original Rows", analyzed.get("original_row_count", "N/A"))
+                with col2:
+                    st.metric("Analyzed Rows", analyzed.get("row_count", "N/A"))
+                
+                st.caption(f"📊 {analyzed.get('description', 'No description')}")
+                
+                st.markdown("**Data the LLM Analyzed:**")
+                if analyzed.get("data"):
+                    import pandas as pd
+                    analyzed_df = pd.DataFrame(analyzed["data"])
+                    st.dataframe(analyzed_df, use_container_width=True)
+            else:
+                st.caption("No analyzed data available (pre-aggregation may have been skipped)")
+            
+            # Additional debug info
+            st.markdown("#### Response Details")
+            st.json({
+                "query_id": result.get("query_id"),
+                "datasource": result.get("datasource"),
+                "execution_time_ms": result.get("execution_time_ms"),
+                "raw_row_count": result.get("results", {}).get("row_count") if result.get("results") else None,
+            })
         
         # Feedback section
         st.divider()

@@ -311,26 +311,27 @@ class MCPClient:
         """
         start_time = time.monotonic()
         
-        # Sanitize query - ONLY use fields, remove filters to avoid schema issues
-        # Date/time filtering is done in Python post-processing
-        sanitized_query = {
+        # Build VizQL query - pass all supported components
+        vizql_query = {
             "fields": query.get("fields", [])
         }
         
-        # Only include parameters if they exist and are valid
-        if query.get("parameters"):
-            sanitized_query["parameters"] = query["parameters"]
-        
-        # Log if we're stripping out filters (for debugging)
+        # Include filters if specified (VizQL Data Service supports complex filters)
         if query.get("filters"):
-            logger.warning(
-                "Stripping filters from query (unsupported schema)",
-                filter_count=len(query.get("filters", []))
+            vizql_query["filters"] = query["filters"]
+            logger.info(
+                "Including filters in query",
+                filter_count=len(query["filters"]),
+                filter_types=[f.get("filterType") for f in query["filters"]]
             )
+        
+        # Include parameters if specified
+        if query.get("parameters"):
+            vizql_query["parameters"] = query["parameters"]
 
         result = await self.call_tool("query-datasource", {
             "datasourceLuid": datasource_id,
-            "query": sanitized_query,
+            "query": vizql_query,
         })
         
         elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -376,6 +377,90 @@ class MCPClient:
             return content
         return []
     
+    async def get_sample_data(
+        self,
+        datasource_id: str,
+        num_rows: int = 5,
+        fields: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get sample rows from a datasource for LLM context.
+        
+        Args:
+            datasource_id: Datasource LUID
+            num_rows: Number of sample rows to fetch (default: 5)
+            fields: Optional list of specific fields to include
+            
+        Returns:
+            List of sample data rows
+        """
+        cache_key = f"sample:{datasource_id}:{num_rows}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        # Build a simple query to get sample rows
+        # We'll query with minimal fields to get representative data
+        if fields:
+            query_fields = [{"fieldCaption": f} for f in fields[:5]]  # Limit fields
+        else:
+            # Get metadata to determine which fields to sample
+            try:
+                metadata = await self.get_datasource_metadata(datasource_id)
+                # Pick a few representative fields (mix of dimensions and measures)
+                sample_fields = []
+                
+                # Add up to 3 dimensions
+                for f in metadata.fields:
+                    if f.role and f.role.value == "DIMENSION":
+                        sample_fields.append(f.name)
+                        if len(sample_fields) >= 3:
+                            break
+                
+                # Add up to 2 measures
+                measure_count = 0
+                for f in metadata.fields:
+                    if f.role and f.role.value == "MEASURE":
+                        sample_fields.append(f.name)
+                        measure_count += 1
+                        if measure_count >= 2:
+                            break
+                
+                # If we couldn't find role-based fields, just take first 5
+                if not sample_fields:
+                    sample_fields = [f.name for f in metadata.fields[:5]]
+                
+                query_fields = [{"fieldCaption": f} for f in sample_fields]
+                
+            except Exception as e:
+                logger.warning(f"Could not get metadata for sample: {e}")
+                # Fallback: just try to query without specific fields
+                query_fields = []
+        
+        try:
+            # Execute query to get sample data
+            # Note: VizQL doesn't have LIMIT, so we'll get all and slice
+            if query_fields:
+                query = {"fields": query_fields}
+            else:
+                # Try to get any data - this may not work for all datasources
+                logger.warning("No fields specified for sample query")
+                return []
+            
+            result = await self.query_datasource(datasource_id, query)
+            
+            # Return limited sample
+            sample = result.data[:num_rows] if result.data else []
+            
+            # Cache the result
+            self._cache[cache_key] = sample
+            
+            logger.info(f"Got {len(sample)} sample rows", datasource_id=datasource_id)
+            return sample
+            
+        except Exception as e:
+            logger.warning(f"Failed to get sample data: {e}")
+            return []
+    
     def clear_cache(self) -> None:
         """Clear the cache."""
         self._cache.clear()
@@ -392,3 +477,4 @@ class MCPClient:
             return True
         except Exception:
             return False
+

@@ -147,7 +147,8 @@ class Query(Base):
     
     # Response
     response_text = Column(Text, nullable=True)
-    response_data = Column(JSON, nullable=True)
+    response_data = Column(JSON, nullable=True)  # Raw query result (limited)
+    analyzed_data = Column(JSON, nullable=True)  # What LLM analyzed (for debugging)
     visualization_config = Column(JSON, nullable=True)
     
     # Status and performance

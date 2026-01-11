@@ -67,18 +67,23 @@ class APIClient:
         self, 
         question: str, 
         datasource_id: Optional[str] = None,
-        username: str = "default_user"
+        username: str = "default_user",
+        thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Send a natural language query."""
+        """Send a natural language query with LangGraph conversation memory."""
         try:
             with self._get_client() as client:
+                payload = {
+                    "question": question,
+                    "datasource_id": datasource_id,
+                    "username": username,
+                }
+                if thread_id:
+                    payload["thread_id"] = thread_id
+                    
                 response = client.post(
                     f"{self.api_url}/query",
-                    json={
-                        "question": question,
-                        "datasource_id": datasource_id,
-                        "username": username,
-                    },
+                    json=payload,
                 )
                 return self._handle_response(response)
         except Exception as e:

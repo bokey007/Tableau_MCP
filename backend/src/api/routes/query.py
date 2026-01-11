@@ -29,6 +29,7 @@ class QueryRequest(BaseModel):
     """Query request schema."""
     question: str = Field(min_length=3, max_length=2000)
     datasource_id: Optional[str] = None
+    thread_id: Optional[str] = None  # LangGraph conversation thread
     username: str = Field(default="default_user")
 
 
@@ -37,10 +38,13 @@ class QueryResponse(BaseModel):
     success: bool
     query_id: Optional[str] = None
     question: str
+    thread_id: Optional[str] = None  # LangGraph thread for continuation
+    message_count: Optional[int] = None  # Messages in conversation
     datasource: Optional[Dict[str, str]] = None
     analysis: Optional[str] = None
     query: Optional[Dict[str, Any]] = None
     results: Optional[Dict[str, Any]] = None
+    analyzed_data: Optional[Dict[str, Any]] = None  # What the LLM actually analyzed
     visualization: Optional[Dict[str, Any]] = None
     execution_time_ms: Optional[float] = None
     error: Optional[str] = None
@@ -107,6 +111,7 @@ async def query_natural_language(
             result = await agent.query(
                 question=request_data.question,
                 datasource_id=request_data.datasource_id,
+                thread_id=request_data.thread_id,  # LangGraph native
             )
         
         execution_time_ms = (time.time() - start_time) * 1000
@@ -122,6 +127,7 @@ async def query_natural_language(
             generated_query=result.get("query"),
             response_text=result.get("analysis"),
             response_data=result.get("results"),
+            analyzed_data=result.get("analyzed_data"),  # What LLM analyzed
             visualization_config=result.get("visualization"),
             execution_time_ms=execution_time_ms,
             row_count=result.get("results", {}).get("row_count") if result.get("results") else None,
@@ -139,10 +145,13 @@ async def query_natural_language(
             success=result.get("success", False),
             query_id=str(query_record.id),
             question=request_data.question,
+            thread_id=result.get("thread_id"),  # LangGraph thread
+            message_count=result.get("message_count"),  # Conversation length
             datasource=datasource_info,
             analysis=result.get("analysis"),
             query=result.get("query"),
             results=result.get("results"),
+            analyzed_data=result.get("analyzed_data"),  # What LLM analyzed
             visualization=result.get("visualization"),
             execution_time_ms=execution_time_ms,
             error=result.get("error"),
@@ -244,6 +253,64 @@ async def get_query_history(
     }
 
 
+# =============================================================================
+# LangGraph Thread Endpoints
+# =============================================================================
+
+@router.get("/thread/{thread_id}")
+async def get_thread_history(
+    thread_id: str,
+):
+    """Get conversation state for a LangGraph thread."""
+    from src.agent import TableauAgent
+    
+    # Use agent to get state (handles graph access)
+    agent = TableauAgent()
+    
+    try:
+        state = await agent.get_state(thread_id)
+        
+        if not state:
+            return {
+                "thread_id": thread_id,
+                "messages": [],
+                "exists": False,
+            }
+        
+        # Extract messages from state
+        messages = []
+        for msg in state.get("messages", []):
+            role = "unknown"
+            if msg.__class__.__name__ == "HumanMessage":
+                role = "user"
+            elif msg.__class__.__name__ == "AIMessage":
+                role = "assistant"
+            elif msg.__class__.__name__ == "SystemMessage":
+                role = "system"
+            elif msg.__class__.__name__ == "ToolMessage":
+                role = "tool"
+                
+            messages.append({
+                "role": role,
+                "content": msg.content,
+                "type": msg.__class__.__name__
+            })
+        
+        return {
+            "thread_id": thread_id,
+            "messages": messages,
+            "message_count": len(messages),
+            "exists": True,
+        }
+    except Exception as e:
+        return {
+            "thread_id": thread_id,
+            "messages": [],
+            "exists": False,
+            "error": str(e),
+        }
+
+
 @router.get("/{query_id}")
 async def get_query(
     query_id: UUID,
@@ -265,6 +332,7 @@ async def get_query(
         "analysis": query.response_text,
         "query": query.generated_query,
         "results": query.response_data,
+        "analyzed_data": query.analyzed_data,  # What LLM analyzed (for debugging)
         "visualization": query.visualization_config,
         "execution_time_ms": query.execution_time_ms,
         "row_count": query.row_count,

@@ -31,6 +31,7 @@ class UserService:
     ) -> User:
         """
         Get existing user or create new one.
+        Handles race conditions with DB unique constraints.
         
         Args:
             username: Unique username
@@ -40,6 +41,9 @@ class UserService:
         Returns:
             User instance
         """
+        from sqlalchemy.exc import IntegrityError
+        
+        # 1. Try to get existing user
         result = await self.db.execute(
             select(User).where(User.username == username)
         )
@@ -51,18 +55,35 @@ class UserService:
             await self.db.flush()
             return user
         
-        # Create new user
-        user = User(
-            username=username,
-            email=email,
-            display_name=display_name or username,
-            last_login_at=datetime.now(timezone.utc),
-        )
-        self.db.add(user)
-        await self.db.flush()
-        
-        logger.info("User created", username=username)
-        return user
+        # 2. Try to create new user
+        try:
+            user = User(
+                username=username,
+                email=email,
+                display_name=display_name or username,
+                last_login_at=datetime.now(timezone.utc),
+            )
+            self.db.add(user)
+            await self.db.flush()
+            
+            logger.info("User created", username=username)
+            return user
+            
+        except IntegrityError:
+            # Race condition: user created by another request in the meantime
+            logger.info("User creation race condition detected, fetching existing", username=username)
+            await self.db.rollback()
+            
+            # Fetch the user that was just created
+            result = await self.db.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                raise ValueError(f"Could not create or fetch user: {username}")
+                
+            return user
     
     async def get_user(self, user_id: UUID) -> Optional[User]:
         """Get user by ID."""
