@@ -3,8 +3,11 @@
 # =============================================================================
 """Main LangGraph workflow for Tableau AI Agent."""
 
+import asyncio
 import json
 import re
+import time
+import uuid
 from typing import Any, Dict, List, Optional, TypedDict, Annotated
 from operator import add
 
@@ -37,6 +40,9 @@ class AgentState(TypedDict, total=False):
     """State for the agent graph with LangGraph native memory."""
     # Conversation messages (LangGraph native - automatically persisted)
     messages: Annotated[List[BaseMessage], add]  # Appends messages automatically
+    
+    # Intent classification
+    intent: str  # "data_query" or "chat"
     
     # Core query fields
     question: str
@@ -101,6 +107,8 @@ Available fields in the datasource:
 4. Use "sortDirection": "DESC" or "ASC" inside fields for ordering
 5. Use "sortPriority": 1, 2, 3... when sorting multiple fields
 6. Use "fieldAlias" to give meaningful names to calculated results
+7. **NO DUPLICATE FIELDS**: Each fieldCaption can only appear ONCE in the fields array. Even with different functions/aliases, Tableau rejects duplicate fieldCaption values. For trends, pick ONE date granularity (YEAR or TRUNC_MONTH, not both).
+8. **NO TABLE CALCULATIONS**: VizQL Data Service does NOT support table calculations like LOOKUP, RUNNING_SUM, RUNNING_AVG, WINDOW_SUM, WINDOW_AVG, INDEX, FIRST, LAST, PREVIOUS_VALUE. For year-over-year comparisons, simply query sales by year and the analysis will compute the comparison.
 
 == FIELD OPTIONS ==
 
@@ -110,9 +118,9 @@ Available fields in the datasource:
 
 **Aliased Field**: {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total Revenue"}}
 
-**Calculated Field** (for ratios, growth, custom metrics):
+**Calculated Field** (ONLY for row-level or aggregate calculations, NOT table calculations):
 {{"fieldCaption": "Profit Margin", "calculation": "SUM([Profit])/SUM([Sales])", "maxDecimalPlaces": 2}}
-{{"fieldCaption": "YoY Growth", "calculation": "(SUM([Sales]) - SUM([Previous Year Sales]))/SUM([Previous Year Sales])"}}
+NOTE: Do NOT use LOOKUP, RUNNING_SUM, or any window functions - they are not supported!
 
 **Date Aggregations**:
 - YEAR, QUARTER, MONTH, WEEK, DAY - extract part of date
@@ -196,6 +204,26 @@ Q: "Compare Furniture vs Technology sales by region"
   ]
 }}
 
+Q: "Sales trend since 2020" or "Yearly sales from 2020"
+{{
+  "fields": [
+    {{"fieldCaption": "Order Date", "function": "YEAR", "fieldAlias": "Year", "sortPriority": 1}},
+    {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total Sales"}}
+  ],
+  "filters": [
+    {{"field": {{"fieldCaption": "Order Date"}}, "filterType": "QUANTITATIVE_DATE", "quantitativeFilterType": "MIN", "minDate": "2020-01-01"}}
+  ]
+}}
+
+Q: "Year over year sales comparison" or "YoY growth"
+NOTE: For YoY comparisons, just query sales by year - the analysis will calculate the growth rates.
+{{
+  "fields": [
+    {{"fieldCaption": "Order Date", "function": "YEAR", "fieldAlias": "Year", "sortPriority": 1, "sortDirection": "ASC"}},
+    {{"fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total Sales"}}
+  ]
+}}
+
 Return ONLY a valid JSON object. No explanation, no markdown."""
 
 
@@ -237,6 +265,11 @@ Schema Valid Fields:
    - If question mentions specific values (e.g., "West region"), is there a SET filter?
    - If question mentions time period, is there a DATE filter?
 
+7. **No Duplicate Fields**: 
+   - Each fieldCaption MUST appear only ONCE in the fields array
+   - Even with different functions/aliases, duplicate fieldCaptions will cause Tableau to reject the query
+   - For date trends, use only ONE aggregation level (YEAR or TRUNC_MONTH, not both)
+
 If the query is GOOD, return exactly: "APPROVED"
 If the query is BAD, return a concise critique explaining EXACTLY what to fix.
 
@@ -245,6 +278,7 @@ Example Critiques:
 - "TOP filter missing fieldToMeasure. Add fieldToMeasure with the measure field."
 - "Question asks for 'West region' but no SET filter for Region. Add filter."
 - "Calculation references [Revenue] but field is called 'Sales'. Fix to [Sales]."
+- "Duplicate fieldCaption 'Order Date' in fields array. Use only one date aggregation (YEAR or TRUNC_MONTH, not both)."
 """
 
 
@@ -262,6 +296,39 @@ Provide a comprehensive analysis including:
 Be concise but thorough."""
 
 
+INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for a Tableau data analysis assistant.
+
+Classify the user's message into one of these categories:
+- **data_query**: The user wants to query, analyze, or visualize data from Tableau datasources
+  - Examples: "Show me sales by region", "What are the top customers?", "Sales trend since 2020"
+  - Also includes follow-ups about data: "Break that down by month", "Show me the details"
+  
+- **chat**: General conversation, greetings, questions about capabilities, or help requests
+  - Examples: "Hello", "How are you?", "What can you do?", "Thanks!", "Help me understand this system"
+  - Also includes meta questions: "Who made you?", "What data do you have access to?"
+
+User message: {question}
+
+Respond with ONLY one word: either "data_query" or "chat"
+"""
+
+
+CHAT_RESPONSE_PROMPT = """You are a friendly AI assistant for Tableau data analysis. The user has sent a conversational message (not a data query).
+
+User message: {question}
+
+Respond naturally and helpfully. If asked about your capabilities, explain that you can:
+- Query and analyze data from connected Tableau datasources
+- Create visualizations and charts
+- Answer questions about sales, customers, products, regions, and other business metrics
+- Provide insights and trends from the data
+
+If greeted, respond warmly and offer to help with data analysis.
+If thanked, acknowledge and offer further assistance.
+
+Keep your response concise and friendly. Don't make up data - if asked about specific numbers, suggest running a data query instead."""
+
+
 # =============================================================================
 # Agent Class
 # =============================================================================
@@ -271,6 +338,10 @@ class TableauAgent:
     
     # Class-level checkpointer (shared across instances for persistence)
     _checkpointer = None
+    # Class-level metadata cache to avoid redundant API calls
+    _metadata_cache: Dict[str, DatasourceMetadata] = {}
+    _cache_ttl_seconds: int = 300  # 5 minutes
+    _cache_timestamps: Dict[str, float] = {}
     
     def __init__(self, mcp_client: Optional[MCPClient] = None):
         """
@@ -292,6 +363,26 @@ class TableauAgent:
             cls._checkpointer = MemorySaver()
             logger.info("Initialized LangGraph MemorySaver checkpointer")
         return cls._checkpointer
+    
+    async def get_cached_metadata(self, datasource_id: str) -> Optional[DatasourceMetadata]:
+        """Get datasource metadata with caching to reduce API calls."""
+        # Check cache
+        if datasource_id in self._metadata_cache:
+            cache_time = self._cache_timestamps.get(datasource_id, 0)
+            if time.time() - cache_time < self._cache_ttl_seconds:
+                logger.info("Using cached metadata", datasource_id=datasource_id)
+                return self._metadata_cache[datasource_id]
+        
+        # Fetch fresh metadata
+        try:
+            metadata = await self.mcp_client.get_datasource_metadata(datasource_id)
+            self._metadata_cache[datasource_id] = metadata
+            self._cache_timestamps[datasource_id] = time.time()
+            logger.info("Cached metadata", datasource_id=datasource_id, fields=len(metadata.fields))
+            return metadata
+        except Exception as e:
+            logger.error("Failed to get metadata", datasource_id=datasource_id, error=str(e))
+            return None
     
     @property
     def llm(self) -> ChatOpenAI:
@@ -319,14 +410,25 @@ class TableauAgent:
         graph = StateGraph(AgentState)
         
         # Add nodes
+        graph.add_node("classify_intent", self._classify_intent)
+        graph.add_node("chat", self._handle_chat)
+        graph.add_node("clarification", self._handle_clarification)
         graph.add_node("discover", self._discover_datasources)
         graph.add_node("plan", self._plan_query)
         graph.add_node("review", self._review_query)
         graph.add_node("execute", self._execute_query)
         graph.add_node("analyze", self._analyze_results)
         
-        # Define edges
-        graph.set_entry_point("discover")
+        # Define edges - start with intent classification
+        graph.set_entry_point("classify_intent")
+        
+        # Route based on intent
+        graph.add_conditional_edges(
+            "classify_intent",
+            self._route_by_intent,
+        )
+        
+        # Data query workflow
         graph.add_edge("discover", "plan")
         graph.add_edge("plan", "review")
         
@@ -341,23 +443,187 @@ class TableauAgent:
         )
         graph.add_edge("analyze", END)
         
+        # Chat and clarification go directly to END
+        graph.add_edge("chat", END)
+        graph.add_edge("clarification", END)
+        
         return graph
+    
+    def _route_by_intent(self, state: AgentState) -> str:
+        """Route based on classified intent."""
+        intent = state.get("intent", "data_query")
+        if intent == "chat":
+            return "chat"
+        if intent == "clarification":
+            return "clarification"
+        return "discover"
     
     def _check_review_outcome(self, state: AgentState) -> str:
         """Determine next step based on critique."""
         if state.get("error"):
             return END
         if state.get("critique") and state.get("critique") != "APPROVED":
-            # If critique exists and we haven't retried too much, go back to plan
-            if state.get("retry_count", 0) < 3:
+            # HARD LIMIT: Max 2 total retries (critique + execution combined)
+            retry_count = state.get("retry_count", 0)
+            if retry_count < 2:
+                logger.info("Query critique, will retry", retry_count=retry_count)
                 return "plan"
+            else:
+                logger.warning("Max retries reached on critique, proceeding to execute anyway")
         return "execute"
     
     def _should_analyze(self, state: AgentState) -> str:
-        """Determine if we should analyze or end."""
+        """Determine if we should analyze, retry, or end."""
         if state.get("error"):
-            return END
+            # HARD LIMIT: Max 2 total retries (critique + execution combined)
+            retry_count = state.get("retry_count", 0)
+            if retry_count < 2:
+                logger.info("Execution error, routing back to plan for fix", 
+                           error=state.get("error")[:100], retry_count=retry_count)
+                return "plan"
+            else:
+                logger.warning("Max retries reached, ending with error", 
+                              error=state.get("error")[:100])
+                return END
         return "analyze"
+    
+    async def _classify_intent(self, state: AgentState) -> AgentState:
+        """Classify user intent to route appropriately."""
+        question = state.get("question", "")
+        logger.info("Classifying intent", question=question[:50])
+        
+        # Quick heuristics for obvious cases (saves an LLM call)
+        question_lower = question.lower().strip()
+        
+        # Obvious greetings
+        greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", 
+                     "howdy", "what's up", "whats up", "sup"]
+        if question_lower in greetings or any(question_lower.startswith(g + " ") for g in greetings[:3]):
+            state["intent"] = "chat"
+            logger.info("Intent classified as chat (greeting heuristic)")
+            return state
+        
+        # Obvious thanks/acknowledgements
+        thanks = ["thanks", "thank you", "thx", "ty", "cheers", "great", "awesome", "perfect", "ok", "okay"]
+        if question_lower in thanks or question_lower.startswith("thanks"):
+            state["intent"] = "chat"
+            logger.info("Intent classified as chat (thanks heuristic)")
+            return state
+        
+        # Obvious capability questions
+        capability_phrases = ["what can you do", "how do you work", "help me", "who are you", 
+                             "what are you", "your capabilities", "can you help"]
+        if any(phrase in question_lower for phrase in capability_phrases):
+            state["intent"] = "chat"
+            logger.info("Intent classified as chat (capability heuristic)")
+            return state
+        
+        # AMBIGUOUS QUESTIONS: Too vague to execute - ask for clarification
+        # These are questions that contain data keywords but lack specificity
+        ambiguous_patterns = [
+            # Single-word or very short queries
+            (len(question_lower.split()) <= 2 and not any(q in question_lower for q in ["top", "total", "count", "sum", "average", "how many"])),
+            # Vague analysis requests
+            question_lower in ["sales", "profit", "revenue", "data", "analysis", "insights", "performance", "results"],
+            # "Show me everything" type
+            any(phrase in question_lower for phrase in ["show me everything", "everything", "all data", "all the data", "give me everything"]),
+            # Very vague requests
+            any(phrase in question_lower for phrase in ["what's the story", "tell me about", "analyze the", "give me insights", "analyze performance"]),
+        ]
+        
+        if any(ambiguous_patterns):
+            state["intent"] = "clarification"
+            logger.info("Intent classified as clarification (ambiguous question)")
+            return state
+        
+        # Data-related keywords suggest data query
+        data_keywords = ["sales", "revenue", "profit", "customer", "product", "region", "trend",
+                        "top", "bottom", "show me", "what is", "how many", "total", "average",
+                        "sum", "count", "by", "breakdown", "compare", "analysis", "data"]
+        if any(kw in question_lower for kw in data_keywords):
+            state["intent"] = "data_query"
+            logger.info("Intent classified as data_query (keyword heuristic)")
+            return state
+        
+        # Use LLM for ambiguous cases
+        try:
+            prompt = INTENT_CLASSIFIER_PROMPT.format(question=question)
+            response = await self.llm.ainvoke(prompt)
+            intent = response.content.strip().lower()
+            
+            if "chat" in intent:
+                state["intent"] = "chat"
+            elif "clarif" in intent:
+                state["intent"] = "clarification"
+            else:
+                state["intent"] = "data_query"  # Default to data query
+            
+            logger.info("Intent classified by LLM", intent=state["intent"])
+            
+        except Exception as e:
+            logger.warning(f"Intent classification failed, defaulting to data_query: {e}")
+            state["intent"] = "data_query"
+        
+        return state
+    
+    async def _handle_chat(self, state: AgentState) -> AgentState:
+        """Handle conversational messages without data queries."""
+        question = state.get("question", "")
+        logger.info("Handling chat message", question=question[:50])
+        
+        try:
+            prompt = CHAT_RESPONSE_PROMPT.format(question=question)
+            response = await self.llm.ainvoke([
+                SystemMessage(content="You are a friendly, helpful AI assistant for Tableau data analysis."),
+                HumanMessage(content=prompt)
+            ])
+            
+            state["analysis"] = response.content
+            state["status"] = "complete"
+            state["messages"] = [AIMessage(content=response.content)]
+            
+            logger.info("Chat response generated")
+            
+        except Exception as e:
+            logger.error(f"Chat response failed: {e}")
+            state["analysis"] = "I apologize, but I'm having trouble responding right now. Please try again or ask me about your data!"
+            state["status"] = "error"
+            state["error"] = str(e)
+        
+        return state
+    
+    async def _handle_clarification(self, state: AgentState) -> AgentState:
+        """Handle ambiguous questions by asking for clarification."""
+        question = state.get("question", "")
+        logger.info("Handling clarification request", question=question[:50])
+        
+        # Generate a helpful clarification response
+        clarification_response = f"""I'd be happy to help you analyze your data, but I need a bit more specifics to give you the best results.
+
+Your question "{question}" could mean different things. Could you please clarify:
+
+**For Sales/Revenue Analysis:**
+- "What are the total sales?" (overall total)
+- "Sales by region" (breakdown by geography)
+- "Top 10 customers by sales" (ranking)
+- "Monthly sales trend" (over time)
+
+**For Profit Analysis:**
+- "Average profit by category"
+- "Which products have the highest profit margin?"
+
+**For Customer Analysis:**
+- "How many unique customers do we have?"
+- "Top 5 customers by revenue"
+
+**What specific question would you like me to answer?**"""
+        
+        state["analysis"] = clarification_response
+        state["status"] = "complete"
+        state["messages"] = [AIMessage(content=clarification_response)]
+        
+        logger.info("Clarification response generated")
+        return state
     
     @property
     def graph(self):
@@ -392,8 +658,9 @@ class TableauAgent:
             # Auto-select if only one
             if len(datasources) == 1:
                 state["selected_datasource"] = datasources[0]
-                metadata = await self.mcp_client.get_datasource_metadata(datasources[0].id)
-                state["metadata"] = metadata
+                metadata = await self.get_cached_metadata(datasources[0].id)
+                if metadata:
+                    state["metadata"] = metadata
                 logger.info("Auto-selected datasource", name=datasources[0].name)
             elif len(datasources) == 0:
                 state["error"] = "No datasources available. Check Tableau connection."
@@ -414,14 +681,19 @@ class TableauAgent:
         
         logger.info("Planning query", question=question[:50], critique=critique)
         
-        if critique and critique != "APPROVED":
+        # Increment retry count if retrying due to critique OR execution error
+        execution_error = state.get("error")
+        if (critique and critique != "APPROVED") or execution_error:
             state["retry_count"] = state.get("retry_count", 0) + 1
-            logger.info("Refining query based on critique", attempt=state["retry_count"])
+            logger.info("Retrying query generation", 
+                       attempt=state["retry_count"], 
+                       reason="execution_error" if execution_error else "critique")
         
         # Select datasource if not selected
         if not state.get("selected_datasource") and datasources:
             if len(datasources) == 1:
                 state["selected_datasource"] = datasources[0]
+                logger.info("Auto-selected single available datasource", name=datasources[0].name)
             else:
                 # Use LLM to select best datasource
                 ds_list = "\n".join([
@@ -430,41 +702,86 @@ class TableauAgent:
                 ])
                 
                 try:
+                    # Provide clearer instructions for datasource selection
+                    system_prompt = (
+                        "Select the best datasource for the question. "
+                        "Prioritize data sources that sound like they contain business data (sales, customers, orders). "
+                        "If the question is general or refers to 'Superstore' data, prefer 'Superstore Datasource'. "
+                        "Return ONLY the exact datasource name from the list below."
+                    )
+                    
                     response = await self.llm.ainvoke([
-                        SystemMessage(content="Select the best datasource for the question. Return only the exact datasource name."),
+                        SystemMessage(content=system_prompt),
                         HumanMessage(content=f"Question: {question}\n\nAvailable Datasources:\n{ds_list}"),
                     ])
                     
-                    selected_name = response.content.strip().lower()
+                    selected_name = response.content.strip()
+                    logger.info("LLM selected datasource", selected=selected_name)
+                    
+                    # Try exact match first
                     for ds in datasources:
-                        if ds.name.lower() in selected_name or selected_name in ds.name.lower():
+                        if ds.name == selected_name:
                             state["selected_datasource"] = ds
                             break
                     
+                    # Try case-insensitive fuzzy match if no exact match
                     if not state.get("selected_datasource"):
-                        # Default to first datasource
+                        selected_name_lower = selected_name.lower()
+                        for ds in datasources:
+                            if ds.name.lower() in selected_name_lower or selected_name_lower in ds.name.lower():
+                                state["selected_datasource"] = ds
+                                break
+                    
+                    # Fallback for general questions if Superstore exists
+                    if not state.get("selected_datasource"):
+                        for ds in datasources:
+                            if "superstore" in ds.name.lower():
+                                state["selected_datasource"] = ds
+                                logger.info("Fallback to Superstore datasource")
+                                break
+                    
+                    # Final fallback
+                    if not state.get("selected_datasource"):
                         state["selected_datasource"] = datasources[0]
                         logger.warning("Could not match datasource, using first")
                         
                 except Exception as e:
                     logger.error("Datasource selection failed", error=str(e))
-                    state["selected_datasource"] = datasources[0]
+                    # Fallback: try Superstore first, then first datasource
+                    for ds in datasources:
+                        if "superstore" in ds.name.lower():
+                            state["selected_datasource"] = ds
+                            logger.info("Exception fallback to Superstore datasource")
+                            break
+                    if not state.get("selected_datasource") and datasources:
+                        state["selected_datasource"] = datasources[0]
+                        logger.warning("Exception fallback to first datasource")
+        
+        # FINAL SAFETY: If still no datasource but we have datasources available, pick one
+        if not state.get("selected_datasource") and datasources:
+            for ds in datasources:
+                if "superstore" in ds.name.lower():
+                    state["selected_datasource"] = ds
+                    logger.info("Safety fallback to Superstore datasource")
+                    break
+            if not state.get("selected_datasource"):
+                state["selected_datasource"] = datasources[0]
+                logger.warning("Safety fallback to first datasource")
         
         if not state.get("selected_datasource"):
             state["error"] = "No datasource selected"
             return state
             
-        # Get metadata if needed
+        # Get metadata if needed (using cache)
         ds = state["selected_datasource"]
         if "metadata" not in state or state.get("metadata_id") != ds.id:
-            try:
-                metadata = await self.mcp_client.get_datasource_metadata(ds.id)
-                state["metadata"] = metadata
-                state["metadata_id"] = ds.id
-                logger.info("Got metadata", datasource=ds.name, fields=len(metadata.fields))
-            except Exception as e:
-                state["error"] = f"Failed to get metadata: {e}"
+            metadata = await self.get_cached_metadata(ds.id)
+            if not metadata:
+                state["error"] = f"Failed to get metadata for {ds.name}"
                 return state
+            state["metadata"] = metadata
+            state["metadata_id"] = ds.id
+            logger.info("Got metadata", datasource=ds.name, fields=len(metadata.fields))
         
         # Generate schema description
         fields_str = state["metadata"].to_schema_description()
@@ -518,10 +835,17 @@ class TableauAgent:
                     sample_lines.append("| " + " | ".join(values) + " |")
                 sample_data_section = "\n".join(sample_lines)
         
-        # Add feedback to prompt if retrying
+        # Add feedback to prompt if retrying (from critique OR execution error)
         feedback_section = ""
         if critique and critique != "APPROVED":
             feedback_section = f"\nPREVIOUS ATTEMPT CRITIQUE (FIX THIS): \n{critique}\n"
+        
+        # Also include execution error if present (e.g., MCP rejected the query)
+        execution_error = state.get("error")
+        if execution_error:
+            feedback_section += f"\nEXECUTION ERROR (FIX THIS): \n{execution_error}\n"
+            # Clear the error so we can try again
+            state["error"] = None
         
         # Build the full prompt with sample data
         full_fields_context = fields_str
@@ -536,23 +860,53 @@ class TableauAgent:
 
         try:
             response = await self.llm.ainvoke(prompt)
-            # Parse JSON from response
             content = response.content.strip()
-            # Remove markdown code blocks if present
-            if "```" in content:
-                content = content.replace("```json", "").replace("```", "")
             
-            try:
-                query = json.loads(content)
+            # Robust JSON extraction
+            query = self._extract_json(content)
+            if query:
+                # POST-PROCESSING: Ensure no duplicate fields by fieldCaption
+                # Tableau rejects queries with duplicate fieldCaption entries
+                if "fields" in query and isinstance(query["fields"], list):
+                    seen_captions = {}
+                    unique_fields = []
+                    for field in query["fields"]:
+                        caption = field.get("fieldCaption")
+                        if not caption:
+                            continue
+                        
+                        # If we haven't seen this caption, or if this new instance 
+                        # has a function (making it more specific), take it.
+                        if caption not in seen_captions:
+                            seen_captions[caption] = field
+                            unique_fields.append(field)
+                        elif field.get("function") and not seen_captions[caption].get("function"):
+                            # Replace existing with one that has a function
+                            idx = unique_fields.index(seen_captions[caption])
+                            unique_fields[idx] = field
+                            seen_captions[caption] = field
+                    
+                    if len(unique_fields) < len(query["fields"]):
+                        logger.info(
+                            "Deduplicated fields in query", 
+                            original=len(query["fields"]), 
+                            unique=len(unique_fields)
+                        )
+                        query["fields"] = unique_fields
+
                 state["vizql_query"] = query
                 logger.info("Generated VizQL query", query=query)
-            except json.JSONDecodeError:
-                 state["error"] = "Failed to parse generated query JSON"
-        except Exception as e:
-            if not critique: # Only fail if it's the first try, otherwise let loop handle error
-                 state["error"] = f"Query generation failed: {e}"
             else:
-                 logger.error("Retry failed", error=str(e))
+                state["error"] = f"Failed to parse query JSON. LLM response: {content[:200]}"
+                logger.warning("JSON extraction failed", response_preview=content[:200])
+                
+        except Exception as e:
+            error_msg = f"Query generation failed: {e}"
+            if state.get("retry_count", 0) == 0:
+                state["error"] = error_msg
+            else:
+                logger.error("Retry failed", error=str(e))
+                state["error"] = error_msg  # Always set error so retry loop can handle
         
         return state
 
@@ -567,6 +921,15 @@ class TableauAgent:
             return state
             
         logger.info("Reviewing query")
+        
+        # Programmatic check for duplicate fields (Tableau rejects these)
+        fields = query.get("fields", [])
+        field_captions = [f.get("fieldCaption") for f in fields if f.get("fieldCaption")]
+        duplicates = [cap for cap in set(field_captions) if field_captions.count(cap) > 1]
+        if duplicates:
+            state["critique"] = f"Duplicate fieldCaption values detected: {duplicates}. Each fieldCaption can only appear ONCE. For date trends, use only ONE aggregation (YEAR or TRUNC_MONTH, not both)."
+            logger.warning("Query has duplicate fields", duplicates=duplicates)
+            return state
         
         fields_str = metadata.to_schema_description()
         query_str = json.dumps(query, indent=2)
@@ -590,8 +953,13 @@ class TableauAgent:
                 state["critique"] = critique
                 
         except Exception as e:
-            logger.error("Review failed, skipping", error=str(e))
-            state["critique"] = "APPROVED" # specific failure shouldn't block execution
+            logger.warning(
+                "Query review LLM call failed - proceeding with execution",
+                error=str(e),
+                query_preview=json.dumps(query)[:200] if query else None
+            )
+            # Proceed to execution - let MCP validate the query instead
+            state["critique"] = "APPROVED"
             
         return state
     
@@ -1180,14 +1548,23 @@ Available calculator tools:
                 name=datasource_id,
             )
         
-        # Configure thread for conversation memory
-        config = {}
+        # Configure thread for conversation memory (always required by checkpointer)
+        effective_thread_id = thread_id or str(uuid.uuid4())
+        config = {"configurable": {"thread_id": effective_thread_id}}
         if thread_id:
-            config = {"configurable": {"thread_id": thread_id}}
-            logger.info("Using LangGraph thread", thread_id=thread_id)
+            logger.info("Using provided LangGraph thread", thread_id=thread_id)
+        else:
+            logger.info("Generated ephemeral thread", thread_id=effective_thread_id)
+        
+        # Request-level timeout to prevent hanging queries
+        QUERY_TIMEOUT_SECONDS = 120  # 2 minutes max per query
         
         try:
-            final_state = await self.graph.ainvoke(initial_state, config=config)
+            # Wrap graph execution in timeout
+            final_state = await asyncio.wait_for(
+                self.graph.ainvoke(initial_state, config=config),
+                timeout=QUERY_TIMEOUT_SECONDS
+            )
             
             result_data = None
             analyzed_data = None
@@ -1238,6 +1615,14 @@ Available calculator tools:
                 )
             
             return result
+        
+        except asyncio.TimeoutError:
+            logger.error("Query timed out", question=question[:50], timeout_seconds=QUERY_TIMEOUT_SECONDS)
+            return {
+                "success": False,
+                "question": question,
+                "error": f"Query timed out after {QUERY_TIMEOUT_SECONDS} seconds. Try simplifying your question.",
+            }
             
         except Exception as e:
             logger.exception("Agent execution failed", error=str(e))

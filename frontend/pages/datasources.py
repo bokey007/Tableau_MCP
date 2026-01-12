@@ -7,150 +7,111 @@ import streamlit as st
 
 # Import shared API client
 import sys
-sys.path.insert(0, '..')
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from components.api_client import api_client as api
+from components.styles import apply_custom_styles, render_header
 
 st.set_page_config(
-    page_title="Datasources - Tableau AI Agent",
+    page_title="Data Assets - Tableau AI Agent",
     page_icon="🗄️",
     layout="wide",
 )
 
-st.title("🗄️ Datasources")
-st.caption("Browse available Tableau datasources and their schemas")
 
+# Apply premium styles
+apply_custom_styles()
+
+# Header
+render_header("Data Assets", "Explore and understand your connected Tableau data catalogs")
 
 # Sidebar
 with st.sidebar:
-    st.subheader("🔍 Search")
-    search_filter = st.text_input("Filter datasources", placeholder="Enter name...")
+    st.markdown("# 🎯 <span class='gradient-text'>Tableau AI</span>", unsafe_allow_html=True)
+    st.divider()
+    
+    st.subheader("🔍 Discovery")
+    search_filter = st.text_input("Search catalog", placeholder="Enter asset name...")
     
     st.divider()
     
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("🔄 Refresh Catalog", use_container_width=True):
         st.rerun()
+    
+    st.page_link("app.py", label="Back to Explorer", icon="🏠")
 
 # Load datasources
 response = api.list_datasources(filter=search_filter if search_filter else None)
 
 if response.get("error"):
-    st.error(f"Failed to load datasources: {response['error']}")
-    st.info("Make sure the backend and MCP server are running.")
+    st.error(f"Catalog synchronization failed: {response['error']}")
 else:
     datasources = response.get("datasources", [])
     
     if not datasources:
-        st.warning("📭 No datasources available.")
-        st.info("""
-        This could mean:
-        - The MCP server is not connected to Tableau
-        - Your Tableau credentials need to be configured
-        - There are no published datasources on your Tableau site
-        """)
+        st.info("No data assets matching your criteria were found.")
     else:
-        st.success(f"🎉 Found {len(datasources)} datasource(s)")
+        # Asset statistics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Available Assets", len(datasources))
+        col2.metric("System Connections", "Live")
+        col3.metric("Auto-Index Status", "Active")
         
-        # Datasource grid
-        for ds in datasources:
-            with st.expander(f"📊 {ds['name']}", expanded=False):
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.markdown(f"**ID:** `{ds['id']}`")
+        st.divider()
+        
+        # Grid layout for assets (using columns for a modern look)
+        cols = st.columns(2)
+        for i, ds in enumerate(datasources):
+            with cols[i % 2]:
+                with st.container(border=True):
+                    st.markdown(f"### 📊 {ds['name']}")
+                    st.caption(f"Asset ID: `{ds['id'][:12]}...` | Project: {ds.get('project_name', 'Default')}")
                     
                     if ds.get("description"):
-                        st.markdown(f"**Description:** {ds['description']}")
-                    else:
-                        st.caption("_No description available_")
+                        st.write(ds["description"])
                     
-                    if ds.get("project_name"):
-                        st.caption(f"📁 Project: {ds['project_name']}")
-                
-                with col2:
-                    # Quick actions
-                    if st.button("🔍 Query This", key=f"query_{ds['id']}", use_container_width=True):
-                        st.session_state.selected_datasource = ds['id']
-                        st.session_state.selected_datasource_name = ds['name']
-                        st.switch_page("app.py")
-                
-                # Schema section
-                st.markdown("---")
-                
-                if st.button("📋 View Schema", key=f"schema_{ds['id']}", use_container_width=True):
-                    with st.spinner("Loading schema..."):
-                        metadata = api.get_datasource_metadata(ds["id"])
-                        
-                        if metadata.get("error"):
-                            st.error(f"Failed to load schema: {metadata['error']}")
-                        else:
-                            # Stats
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("📏 Dimensions", metadata.get("dimension_count", 0))
-                            col2.metric("📊 Measures", metadata.get("measure_count", 0))
-                            col3.metric("📋 Total Fields", len(metadata.get("fields", [])))
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("🔌 Connect & Query", key=f"q_{ds['id']}", use_container_width=True):
+                            st.session_state.selected_datasource = ds['id']
+                            st.switch_page("app.py")
+                    with c2:
+                        if st.button("📋 Inspect Schema", key=f"s_{ds['id']}", use_container_width=True):
+                            # In-place expansion or modal simulation
+                            metadata = api.get_datasource_metadata(ds["id"])
+                            if not metadata.get("error"):
+                                st.session_state[f"meta_{ds['id']}"] = metadata
+                    
+                    # Display metadata if requested
+                    if f"meta_{ds['id']}" in st.session_state:
+                        meta = st.session_state[f"meta_{ds['id']}"]
+                        with st.status("Schema Details", expanded=True):
+                            m1, m2, m3 = st.columns(3)
+                            m1.metric("Dims", meta.get("dimension_count", 0))
+                            m2.metric("Measures", meta.get("measure_count", 0))
+                            m3.metric("Total", len(meta.get("fields", [])))
                             
-                            # Fields table
-                            fields = metadata.get("fields", [])
-                            
-                            if fields:
-                                # Categorize fields
-                                dimensions = [f for f in fields if f.get("role") == "DIMENSION"]
-                                measures = [f for f in fields if f.get("role") == "MEASURE"]
-                                others = [f for f in fields if f.get("role") not in ["DIMENSION", "MEASURE"]]
-                                
-                                if dimensions:
-                                    st.markdown("**📏 Dimensions**")
-                                    for f in dimensions:
-                                        desc = f" _{f['description']}_" if f.get("description") else ""
-                                        st.markdown(f"- `{f['name']}` ({f['data_type']}){desc}")
-                                
-                                if measures:
-                                    st.markdown("**📊 Measures**")
-                                    for f in measures:
-                                        agg = f" [{f['default_aggregation']}]" if f.get("default_aggregation") else ""
-                                        desc = f" _{f['description']}_" if f.get("description") else ""
-                                        st.markdown(f"- `{f['name']}` ({f['data_type']}){agg}{desc}")
-                                
-                                if others:
-                                    with st.expander("Other Fields"):
-                                        for f in others:
-                                            st.markdown(f"- `{f['name']}` ({f['data_type']})")
-                            else:
-                                st.info("No field information available")
-                            
-                            # Raw schema for copying
-                            with st.expander("📄 Schema Description (for AI)"):
-                                st.code(metadata.get("schema_description", "N/A"))
-                            
-                            # Copy button for schema
-                            st.markdown("---")
-                            st.caption("💡 Use the schema description above when crafting complex queries")
-
-
-# Tips section
+                            st.markdown("**Field Sample:**")
+                            fields = meta.get("fields", [])[:10]
+                            for f in fields:
+                                st.caption(f"- {f['name']} ({f['data_type']})")
+                            if len(meta.get("fields", [])) > 10:
+                                st.caption(f"... and {len(meta.get('fields', [])) - 10} more")
+        
 st.divider()
 
-with st.expander("💡 Tips for querying datasources"):
-    st.markdown("""
-    ### How to get the best results:
-    
-    1. **Be specific**: Instead of "show me sales", try "show total sales by region for 2024"
-    
-    2. **Reference field names**: Use the actual field names from the schema when possible
-    
-    3. **Include aggregations**: Specify SUM, AVG, COUNT when asking about measures
-    
-    4. **Add filters**: Mention specific values like dates, categories, or regions
-    
-    5. **Limit results**: Use "top 10" or "first 5" to get focused results
-    
-    ### Example queries:
-    - "What are the top 10 customers by total sales amount?"
-    - "Show me monthly revenue trends for the last 12 months"
-    - "Compare sales vs profit by product category"
-    - "Which regions have profit margin below 10%?"
-    """)
+# Proactive Tips
+with st.container(border=True):
+    st.markdown("### 💡 Expert Deployment Tips")
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.markdown("**Clarity is King**")
+        st.caption("Reference specific field names from the 'Inspect Schema' view for 100% accuracy.")
+    with t2:
+        st.markdown("**Temporal Intelligence**")
+        st.caption("Mention 'This Year', 'Q3', or 'Previous Month' for smart time-series filtering.")
+    with t3:
+        st.markdown("**Visualization Hints**")
+        st.caption("Ask for a 'Pie chart' or 'Trend line' to influence how results are rendered.")
 
-# Footer
-st.divider()
-st.page_link("app.py", label="← Back to Home", icon="🏠")
+st.caption("Data Catalog Synchronized: Recently | Powered by Tableau Metadata API")

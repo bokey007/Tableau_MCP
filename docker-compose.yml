@@ -40,22 +40,22 @@ services:
       # Transport
       TRANSPORT: http
       PORT: 3927
-      
+
       # Tableau Configuration
       SERVER: ${TABLEAU_SERVER:-}
       SITE_NAME: ${TABLEAU_SITE_NAME:-}
-      
+
       # Authentication: Direct Trust (Connected Apps)
       AUTH: direct-trust
-      
+
       # Connected Apps credentials
       CONNECTED_APP_CLIENT_ID: ${TABLEAU_CONNECTED_APP_CLIENT_ID:-}
       CONNECTED_APP_SECRET_ID: ${TABLEAU_CONNECTED_APP_SECRET_ID:-}
       CONNECTED_APP_SECRET_VALUE: ${TABLEAU_CONNECTED_APP_SECRET_VALUE:-}
-      
+
       # JWT Subject Claim - your Tableau username
       JWT_SUB_CLAIM: ${TABLEAU_USERNAME:-}
-      
+
       # MCP Settings
       DANGEROUSLY_DISABLE_OAUTH: "true"
       ENABLE_SERVER_LOGGING: "true"
@@ -63,7 +63,7 @@ services:
     ports:
       - "3927:3927"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3927/health"]
+      test: ["CMD", "wget", "-q", "--spider", "-O", "-", "http://localhost:3927/tableau-mcp"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -85,28 +85,28 @@ services:
       DEBUG: "true"
       LOG_LEVEL: INFO
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
-      
+
       # API
       BACKEND_HOST: "0.0.0.0"
       BACKEND_PORT: "8000"
       API_PREFIX: /api/v1
       CORS_ORIGINS: "http://localhost:8501,http://localhost:3000"
-      
+
       # Database
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_USER: ${POSTGRES_USER:-tableau_mcp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
       POSTGRES_DB: ${POSTGRES_DB:-tableau_mcp_db}
-      
+
       # OpenAI
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4-turbo-preview}
-      
+
       # MCP Server
       MCP_SERVER_URL: http://mcp:3927/tableau-mcp
-      MCP_REQUEST_TIMEOUT: "60"
-      
+      MCP_REQUEST_TIMEOUT: "180"
+
       # Tableau (also passed for direct API access if needed)
       TABLEAU_SERVER: ${TABLEAU_SERVER:-}
       TABLEAU_SITE_NAME: ${TABLEAU_SITE_NAME:-}
@@ -114,7 +114,7 @@ services:
       TABLEAU_CONNECTED_APP_SECRET_ID: ${TABLEAU_CONNECTED_APP_SECRET_ID:-}
       TABLEAU_CONNECTED_APP_SECRET_VALUE: ${TABLEAU_CONNECTED_APP_SECRET_VALUE:-}
       TABLEAU_USERNAME: ${TABLEAU_USERNAME:-}
-      
+
       # Activity Tracking
       ENABLE_ACTIVITY_TRACKING: "true"
     ports:
@@ -122,6 +122,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/live"]
       interval: 30s

@@ -20,7 +20,7 @@ from tenacity import (
 )
 
 from src.core.config import settings
-from src.core.exceptions import MCPClientError, MCPConnectionError, MCPToolError
+from src.core.exceptions import MCPClientError, MCPConnectionError, MCPToolError, MCPRateLimitError
 from src.core.logging import get_logger
 from src.mcp.models import (
     Datasource,
@@ -102,9 +102,10 @@ class MCPClient:
                 return self._session_id
     
     @retry(
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, MCPRateLimitError)),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        before_sleep=before_sleep_log(logger, "INFO"),
     )
     async def _send_request(
         self,
@@ -131,6 +132,12 @@ class MCPClient:
         try:
             # POST directly to base_url - the path is included in the URL
             response = await client.post("", json=payload, headers=headers)
+            
+            # Check for rate limits (429) specifically
+            if response.status_code == 429:
+                logger.warning("Tableau API Rate limit reached (429)", method=method)
+                raise MCPRateLimitError(f"Rate limit reached for {method}")
+                
             response.raise_for_status()
         except httpx.ConnectError as e:
             logger.error("MCP connection failed", error=str(e))
@@ -139,6 +146,8 @@ class MCPClient:
             logger.error("MCP request timed out", error=str(e))
             raise MCPClientError(f"Request timed out after {self.timeout}s: {e}")
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                 raise MCPRateLimitError(f"Rate limit reached for {method}")
             logger.error("MCP HTTP error", status=e.response.status_code)
             raise MCPClientError(f"HTTP error {e.response.status_code}: {e.response.text}")
         
@@ -172,11 +181,24 @@ class MCPClient:
         if "error" in result:
             error = result["error"]
             error_msg = error.get("message", "Unknown MCP error")
+            error_code = str(error.get("code", ""))
+            
+            # Detect rate limit in RPC response (some implementations return 200 OK with 429 in body)
+            if "429" in error_msg or "429" in error_code or "limit reached" in error_msg.lower():
+                logger.warning("Tableau API Rate limit detected in RPC response", message=error_msg)
+                raise MCPRateLimitError(f"Rate limit reached (RPC): {error_msg}")
+
             logger.error("MCP RPC Error", error=error)
             raise MCPClientError(f"RPC Error: {error_msg}") from None
             
         return result.get("result", {})
     
+    @retry(
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, MCPRateLimitError)),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        before_sleep=before_sleep_log(logger, "INFO"),
+    )
     async def call_tool(
         self,
         tool_name: str,
@@ -203,10 +225,17 @@ class MCPClient:
             if isinstance(result, dict) and result.get("isError"):
                 content = result.get("content", [{}])
                 error_msg = content[0].get("text", "Unknown error") if content else "Unknown error"
+                
+                # CRITICAL: Detect rate limit error hidden inside a successful JSON-RPC response
+                # The MCP server returns isError=true but the HTTP status is still 200 OK
+                if "429" in error_msg or "limit reached" in error_msg.lower():
+                    logger.warning("Tableau API Rate limit detected in tool response", tool=tool_name)
+                    raise MCPRateLimitError(f"Rate limit reached for {tool_name}: {error_msg}")
+                
                 raise MCPToolError(tool_name, error_msg)
             
             return result
-        except MCPClientError:
+        except (MCPClientError, MCPRateLimitError):
             raise
         except Exception as e:
             logger.exception(f"Unexpected error calling tool {tool_name}")

@@ -54,6 +54,12 @@ class MCPToolError(MCPClientError):
         super().__init__(f"Tool '{tool_name}' failed: {message}", error_code="MCP_TOOL_ERROR")
 
 
+class MCPRateLimitError(MCPClientError):
+    """MCP rate limit error (429)."""
+    def __init__(self, message: str = "Rate limit reached"):
+        super().__init__(message, status_code=429, error_code="MCP_RATE_LIMIT")
+
+
 class DatabaseError(TableauMCPError):
     """Database error."""
     def __init__(self, message: str, **kwargs):

@@ -11,7 +11,7 @@ import httpx
 # Configuration
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 API_PREFIX = "/api/v1"
-DEFAULT_TIMEOUT = 120.0
+DEFAULT_TIMEOUT = 300.0
 
 
 class APIClient:
