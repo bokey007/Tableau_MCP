@@ -143,8 +143,8 @@ for msg in st.session_state.chat_messages:
                     
                     with tab_data:
                         df = pd.DataFrame(data)
-                        st.dataframe(df.head(10), use_container_width=True)
-                        st.caption(f"Showing 10 of {len(df)} rows.")
+                        st.dataframe(df, use_container_width=True, height=400)
+                        st.caption(f"Showing all {len(df)} rows.")
                     
                     st.markdown('</div>', unsafe_allow_html=True)
 
