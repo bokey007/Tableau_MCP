@@ -1428,11 +1428,31 @@ Available calculator tools:
         if len(df) > MAX_ROWS_FOR_LLM:
             logger.info(f"Large dataset detected ({len(df)} rows), applying smart summarization")
             
+            # Check if question is about losses, negatives, or bottom performers
+            is_loss_question = any(word in question_lower for word in [
+                'loss', 'losing', 'negative', 'lowest', 'worst', 'bottom', 
+                'least', 'minimum', 'min', 'poorest', 'underperforming'
+            ])
+            
             # Option A: If we have dimensions, aggregate by the first one
             if string_cols and numeric_cols:
                 agg_dict = {col: 'sum' for col in numeric_cols}
-                result = df.groupby(string_cols[0]).agg(agg_dict).reset_index()
-                result = result.sort_values(numeric_cols[0], ascending=False).head(MAX_ROWS_FOR_LLM)
+                aggregated = df.groupby(string_cols[0]).agg(agg_dict).reset_index()
+                
+                # Sort based on question intent
+                if is_loss_question:
+                    # For loss questions, sort ascending to show worst performers first
+                    result = aggregated.sort_values(numeric_cols[0], ascending=True).head(MAX_ROWS_FOR_LLM)
+                    logger.info(f"Sorted ascending for loss question", showing="bottom performers")
+                else:
+                    # For general/top questions, show both extremes
+                    # Take top 25 and bottom 25 to capture full picture
+                    sorted_desc = aggregated.sort_values(numeric_cols[0], ascending=False)
+                    top_half = sorted_desc.head(MAX_ROWS_FOR_LLM // 2)
+                    bottom_half = sorted_desc.tail(MAX_ROWS_FOR_LLM // 2)
+                    result = pd.concat([top_half, bottom_half]).drop_duplicates()
+                    logger.info(f"Included both top and bottom performers")
+                
                 logger.info(f"Aggregated by {string_cols[0]}", original=original_row_count, final=len(result))
                 return result
             
