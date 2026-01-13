@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     
     # Tableau MCP Server
     mcp_server_url: str = Field(default="http://mcp:3927")
-    mcp_request_timeout: int = Field(default=180)
+    mcp_request_timeout: int = Field(default=240)  # 4 minutes for complex Tableau API calls
     
     # Tableau Cloud Configuration
     tableau_server: Optional[str] = Field(default=None)

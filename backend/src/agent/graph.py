@@ -1557,7 +1557,7 @@ Available calculator tools:
             logger.info("Generated ephemeral thread", thread_id=effective_thread_id)
         
         # Request-level timeout to prevent hanging queries
-        QUERY_TIMEOUT_SECONDS = 120  # 2 minutes max per query
+        QUERY_TIMEOUT_SECONDS = 240  # 4 minutes max per query (increased for complex trend queries)
         
         try:
             # Wrap graph execution in timeout

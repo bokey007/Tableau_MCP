@@ -141,15 +141,15 @@ class MCPClient:
             response.raise_for_status()
         except httpx.ConnectError as e:
             logger.error("MCP connection failed", error=str(e))
-            raise MCPConnectionError(f"Failed to connect to MCP server at {self.base_url}: {e}")
+            raise MCPConnectionError(f"MCP Server connection failed at {self.base_url}. Check if MCP server is running: {e}")
         except httpx.TimeoutException as e:
-            logger.error("MCP request timed out", error=str(e))
-            raise MCPClientError(f"Request timed out after {self.timeout}s: {e}")
+            logger.error("MCP request timed out", error=str(e), timeout=self.timeout)
+            raise MCPClientError(f"MCP Server request timed out after {self.timeout}s. This may indicate Tableau Cloud is slow to respond: {e}")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
-                 raise MCPRateLimitError(f"Rate limit reached for {method}")
+                 raise MCPRateLimitError(f"Tableau API rate limit reached (429). Wait a few minutes and try again.")
             logger.error("MCP HTTP error", status=e.response.status_code)
-            raise MCPClientError(f"HTTP error {e.response.status_code}: {e.response.text}")
+            raise MCPClientError(f"MCP HTTP error {e.response.status_code}: {e.response.text[:200]}")
         
         elapsed_ms = (time.monotonic() - start_time) * 1000
         logger.debug("MCP request completed", method=method, elapsed_ms=round(elapsed_ms, 2))
@@ -230,9 +230,9 @@ class MCPClient:
                 # The MCP server returns isError=true but the HTTP status is still 200 OK
                 if "429" in error_msg or "limit reached" in error_msg.lower():
                     logger.warning("Tableau API Rate limit detected in tool response", tool=tool_name)
-                    raise MCPRateLimitError(f"Rate limit reached for {tool_name}: {error_msg}")
+                    raise MCPRateLimitError(f"Tableau API rate limit reached during {tool_name}. Wait a few minutes and try again.")
                 
-                raise MCPToolError(tool_name, error_msg)
+                raise MCPToolError(tool_name, f"Tableau query failed: {error_msg}")
             
             return result
         except (MCPClientError, MCPRateLimitError):
