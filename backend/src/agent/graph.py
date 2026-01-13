@@ -14,7 +14,7 @@ from operator import add
 import pandas as pd
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage, ToolMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -385,18 +385,35 @@ class TableauAgent:
             return None
     
     @property
-    def llm(self) -> ChatOpenAI:
-        """Get LLM instance (lazy initialization)."""
+    def llm(self):
+        """Get LLM instance (lazy initialization). Supports OpenAI and Azure OpenAI."""
         if self._llm is None:
-            if not settings.openai_configured:
-                raise ValidationError("OpenAI API key not configured")
-            
-            self._llm = ChatOpenAI(
-                model=settings.openai_model,
-                temperature=settings.openai_temperature,
-                api_key=settings.openai_api_key,
-                max_retries=settings.openai_max_retries,
-            )
+            if settings.llm_provider == "azure":
+                # Azure OpenAI
+                if not settings.azure_openai_configured:
+                    raise ValidationError("Azure OpenAI not configured. Set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_DEPLOYMENT.")
+                
+                logger.info("Initializing Azure OpenAI LLM", deployment=settings.azure_openai_deployment)
+                self._llm = AzureChatOpenAI(
+                    azure_deployment=settings.azure_openai_deployment,
+                    azure_endpoint=settings.azure_openai_endpoint,
+                    api_key=settings.azure_openai_api_key,
+                    api_version=settings.azure_openai_api_version,
+                    temperature=settings.openai_temperature,
+                    max_retries=settings.openai_max_retries,
+                )
+            else:
+                # Standard OpenAI
+                if not settings.openai_configured:
+                    raise ValidationError("OpenAI API key not configured. Set OPENAI_API_KEY.")
+                
+                logger.info("Initializing OpenAI LLM", model=settings.openai_model)
+                self._llm = ChatOpenAI(
+                    model=settings.openai_model,
+                    temperature=settings.openai_temperature,
+                    api_key=settings.openai_api_key,
+                    max_retries=settings.openai_max_retries,
+                )
         return self._llm
     
     @property

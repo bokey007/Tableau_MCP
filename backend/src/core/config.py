@@ -34,11 +34,20 @@ class Settings(BaseSettings):
     api_prefix: str = Field(default="/api/v1")
     cors_origins: str = Field(default="http://localhost:8501")
     
-    # OpenAI - Default to empty string for graceful startup
+    # LLM Provider Configuration
+    llm_provider: str = Field(default="openai")  # "openai" or "azure"
+    
+    # OpenAI Configuration
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4-turbo-preview")
     openai_temperature: float = Field(default=0.0)  # 0 for consistent query generation
     openai_max_retries: int = Field(default=3)
+    
+    # Azure OpenAI Configuration
+    azure_openai_api_key: str = Field(default="")
+    azure_openai_endpoint: str = Field(default="")  # e.g., https://your-resource.openai.azure.com/
+    azure_openai_deployment: str = Field(default="")  # Your deployment name
+    azure_openai_api_version: str = Field(default="2024-02-15-preview")
     
     # Tableau MCP Server
     mcp_server_url: str = Field(default="http://mcp:3927")
@@ -106,6 +115,22 @@ class Settings(BaseSettings):
     def openai_configured(self) -> bool:
         """Check if OpenAI is properly configured."""
         return bool(self.openai_api_key and self.openai_api_key.startswith("sk-"))
+    
+    @property
+    def azure_openai_configured(self) -> bool:
+        """Check if Azure OpenAI is properly configured."""
+        return all([
+            self.azure_openai_api_key,
+            self.azure_openai_endpoint,
+            self.azure_openai_deployment,
+        ])
+    
+    @property
+    def llm_configured(self) -> bool:
+        """Check if the selected LLM provider is properly configured."""
+        if self.llm_provider == "azure":
+            return self.azure_openai_configured
+        return self.openai_configured
     
     @property
     def tableau_configured(self) -> bool:
