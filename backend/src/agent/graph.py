@@ -445,8 +445,11 @@ class TableauAgent:
             self._route_by_intent,
         )
         
-        # Data query workflow
-        graph.add_edge("discover", "plan")
+        # Data query workflow - route based on discovery success
+        graph.add_conditional_edges(
+            "discover",
+            self._check_discovery_outcome,
+        )
         graph.add_edge("plan", "review")
         
         graph.add_conditional_edges(
@@ -474,6 +477,17 @@ class TableauAgent:
         if intent == "clarification":
             return "clarification"
         return "discover"
+    
+    def _check_discovery_outcome(self, state: AgentState) -> str:
+        """Check if datasource discovery succeeded."""
+        if state.get("error"):
+            logger.error("Discovery failed, ending workflow", error=state.get("error"))
+            return END
+        if not state.get("datasources"):
+            state["error"] = "No datasources available. Check Tableau connection."
+            logger.error("No datasources found")
+            return END
+        return "plan"
     
     def _check_review_outcome(self, state: AgentState) -> str:
         """Determine next step based on critique."""
