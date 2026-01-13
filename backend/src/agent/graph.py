@@ -284,8 +284,17 @@ Example Critiques:
 
 ANALYZER_PROMPT = """Analyze these query results to answer: {question}
 
+Query Executed:
+{query}
+
 Data:
 {results}
+
+CRITICAL RULES:
+- If the query used an aggregate function (SUM, AVG, COUNT, MAX, MIN) and returned 
+  a single row, do NOT claim patterns about "variation", "uniformity", or "consistency"
+- A single aggregate value has no variance by definition - don't over-interpret it
+- Only describe what the actual data shows, never speculate beyond the results
 
 Provide a comprehensive analysis including:
 1. **Direct Answer**: Clearly answer the original question
@@ -1092,6 +1101,7 @@ Your question "{question}" could mean different things. Could you please clarify
             
             prompt = ANALYZER_PROMPT.format(
                 question=question,
+                query=json.dumps(state.get("query", {}), indent=2),
                 results=analysis_data,
             )
             
