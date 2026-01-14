@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Analytics Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+    <!-- Tableau Extensions API -->
+    <script src="https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk"></script>
+    <script src="https://extensions.tableau.com/api/v1/tableau.extensions.1.latest.min.js"></script>
+  </head>
+  <body>
+    <div class="extension-container">
+      <!-- Header -->
+      <div class="header">
+        <div class="header-icon">🤖</div>
+        <div class="header-text">
+          <h1>AI Analytics</h1>
+          <span class="status" id="connectionStatus">Connecting...</span>
+        </div>
+      </div>
+
+      <!-- Chat Messages -->
+      <div class="chat-container" id="chatContainer">
+        <div class="message assistant">
+          <div class="message-content">
+            Hello! I can help you analyze your data. Ask me anything about your
+            dashboard.
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div class="input-area">
+        <div class="input-wrapper">
+          <input
+            type="text"
+            id="userInput"
+            placeholder="Ask a question about your data..."
+            autocomplete="off"
+          />
+          <button id="sendBtn" onclick="sendMessage()">
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+            </svg>
+          </button>
+        </div>
+        <div class="input-hint">Press Enter to send • Powered by AI</div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
