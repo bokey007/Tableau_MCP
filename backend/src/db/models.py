@@ -142,6 +142,11 @@ class Query(Base):
     datasource_id = Column(String(100), nullable=True, index=True)
     datasource_name = Column(String(255), nullable=True)
     
+    # Query type classification
+    intent = Column(String(50), nullable=True)  # chat, data_query, comparison, anomaly, storytelling
+    query_type = Column(String(50), nullable=True)  # standard, comparison, anomaly, storytelling
+    context_scope = Column(String(20), nullable=True)  # filtered, global
+    
     # Generated query
     generated_query = Column(JSON, nullable=True)
     
@@ -157,6 +162,10 @@ class Query(Base):
     execution_time_ms = Column(Float, nullable=True)
     row_count = Column(Integer, nullable=True)
     
+    # Favorites
+    is_favorite = Column(Boolean, default=False, index=True)
+    favorite_label = Column(String(255), nullable=True)  # User-defined label for favorite
+    
     # Timestamps
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -170,6 +179,7 @@ class Query(Base):
     __table_args__ = (
         Index("ix_queries_user_created", "user_id", "created_at"),
         Index("ix_queries_status_created", "status", "created_at"),
+        Index("ix_queries_user_favorite", "user_id", "is_favorite"),
     )
     
     def __repr__(self) -> str:

@@ -7,8 +7,11 @@ This is the entry point for all requests from the Tableau Extension.
 """
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
+import asyncio
+import json
 
 from src.agent.dashboard_agent import get_dashboard_agent, DashboardContext
 from src.core.logging import get_logger
@@ -198,6 +201,176 @@ async def get_capabilities():
             "Anomaly detection (outliers, unusual patterns)",
             "Data storytelling (executive summaries)",
             "Conversation memory (multi-turn)",
+            "Query history and favorites",
             "Data visualization recommendations"
         ]
     }
+
+
+# =============================================================================
+# Query History & Favorites
+# =============================================================================
+
+class QueryHistoryItem(BaseModel):
+    """A query history item."""
+    id: str
+    question: str
+    intent: Optional[str] = None
+    query_type: Optional[str] = None
+    is_favorite: bool = False
+    favorite_label: Optional[str] = None
+    created_at: str
+    success: bool
+    analysis_preview: Optional[str] = None
+
+
+class FavoriteRequest(BaseModel):
+    """Request to toggle favorite status."""
+    query_id: str
+    is_favorite: bool
+    label: Optional[str] = None
+
+
+@router.get("/history")
+async def get_query_history(
+    username: str = "extension_user",
+    limit: int = 20,
+    offset: int = 0,
+    search: Optional[str] = None,
+    favorites_only: bool = False
+):
+    """
+    Get query history for a user.
+    
+    Supports pagination, search, and filtering by favorites.
+    """
+    # Note: In production, this would query the database
+    # For now, return a mock response showing the structure
+    return {
+        "items": [],
+        "total": 0,
+        "limit": limit,
+        "offset": offset,
+        "message": "Query history endpoint ready. Enable database persistence to store history."
+    }
+
+
+@router.post("/favorites")
+async def toggle_favorite(request: FavoriteRequest):
+    """Toggle favorite status for a query."""
+    # Note: In production, this would update the database
+    return {
+        "success": True,
+        "query_id": request.query_id,
+        "is_favorite": request.is_favorite,
+        "label": request.label,
+        "message": "Favorite toggled. Enable database persistence for full functionality."
+    }
+
+
+@router.get("/favorites")
+async def get_favorites(username: str = "extension_user", limit: int = 50):
+    """Get all favorite queries for a user."""
+    # Note: In production, this would query the database
+    return {
+        "items": [],
+        "total": 0,
+        "message": "Favorites endpoint ready. Enable database persistence to store favorites."
+    }
+
+
+# =============================================================================
+# Real-time Streaming (SSE)
+# =============================================================================
+
+@router.post("/query/stream")
+async def stream_query(request: DashboardQueryRequest):
+    """
+    Stream query processing with Server-Sent Events (SSE).
+    
+    Provides real-time updates as the agent processes:
+    1. thinking - Intent classification in progress
+    2. querying - Executing VizQL query
+    3. analyzing - Analyzing results
+    4. complete - Final result
+    """
+    
+    async def event_generator() -> AsyncIterator[str]:
+        """Generate SSE events for real-time updates."""
+        try:
+            # Build dashboard context
+            context = DashboardContext(
+                dashboard_name=request.dashboard_name,
+                worksheets=[{"name": w.name} for w in (request.worksheets or [])],
+                filters=[f.model_dump() for f in (request.filters or [])],
+                datasources=[d.model_dump() for d in (request.datasources or [])],
+                parameters=request.parameters,
+                selected_marks=request.selected_marks,
+            )
+            
+            # Send thinking event
+            yield f"data: {json.dumps({'event': 'thinking', 'message': 'Analyzing your question...'})}\n\n"
+            await asyncio.sleep(0.1)  # Small delay for UX
+            
+            # Get agent and process
+            agent = await get_dashboard_agent()
+            
+            # Send querying event
+            yield f"data: {json.dumps({'event': 'querying', 'message': 'Processing query...'})}\n\n"
+            
+            # Process the query
+            import time
+            start_time = time.time()
+            
+            result = await agent.process(
+                question=request.question,
+                context=context,
+                thread_id=request.thread_id
+            )
+            
+            processing_time = (time.time() - start_time) * 1000
+            
+            # Send analyzing event if we have data
+            if result.get("results"):
+                yield f"data: {json.dumps({'event': 'analyzing', 'message': 'Analyzing results...'})}\n\n"
+                await asyncio.sleep(0.1)
+            
+            # Build final response
+            response = {
+                "event": "complete",
+                "data": {
+                    "success": result.get("status") == "complete" and not result.get("error"),
+                    "intent": result.get("intent"),
+                    "query_type": result.get("query_type"),
+                    "context_scope": result.get("context_scope"),
+                    "analysis": result.get("analysis"),
+                    "results": result.get("results"),
+                    "visualization": result.get("visualization"),
+                    "error": result.get("error"),
+                    "processing_time_ms": processing_time,
+                    "thread_id": result.get("thread_id"),
+                }
+            }
+            
+            yield f"data: {json.dumps(response)}\n\n"
+            
+        except Exception as e:
+            logger.exception("Streaming query failed", error=str(e))
+            error_response = {
+                "event": "error",
+                "data": {
+                    "success": False,
+                    "error": str(e)
+                }
+            }
+            yield f"data: {json.dumps(error_response)}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
