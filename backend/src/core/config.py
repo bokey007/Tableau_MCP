@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="0.0.0.0")
     backend_port: int = Field(default=8000)
     api_prefix: str = Field(default="/api/v1")
-    cors_origins: str = Field(default="http://localhost:8501")
+    cors_origins: str = Field(default="http://localhost:8501,http://localhost:8080,http://127.0.0.1:8080")
     
     # LLM Provider Configuration
     llm_provider: str = Field(default="openai")  # "openai" or "azure"
