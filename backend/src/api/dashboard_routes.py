@@ -60,6 +60,8 @@ class DashboardQueryResponse(BaseModel):
     """Response to Tableau Extension."""
     success: bool
     intent: Optional[str] = None
+    query_type: Optional[str] = None  # standard, comparison, anomaly, storytelling
+    context_scope: Optional[str] = None  # filtered or global
     analysis: Optional[str] = None
     results: Optional[Dict[str, Any]] = None
     visualization: Optional[Dict[str, Any]] = None
@@ -168,15 +170,34 @@ async def get_capabilities():
                 "examples": ["sales", "show data"]
             },
             {
+                "name": "comparison",
+                "description": "Compare time periods, regions, or categories",
+                "examples": ["Compare Q1 vs Q2", "Year over year growth", "East vs West region"]
+            },
+            {
+                "name": "anomaly",
+                "description": "Detect outliers and unusual patterns",
+                "examples": ["What's unusual?", "Find anomalies", "Any red flags?"]
+            },
+            {
+                "name": "storytelling",
+                "description": "Generate executive summaries and narratives",
+                "examples": ["Summarize this dashboard", "Executive summary", "Tell me the story"]
+            },
+            {
                 "name": "data_query",
-                "description": "Execute data analysis queries",
-                "examples": ["Top 5 customers", "Sales trend", "Compare regions"]
+                "description": "Execute standard data analysis queries",
+                "examples": ["Top 5 customers", "Sales trend", "Total by region"]
             }
         ],
         "features": [
             "Natural language queries",
             "Dashboard context awareness",
-            "Filter-aware responses",
+            "Filter-aware responses (filtered vs global scope)",
+            "Comparison analysis (Q1 vs Q2, YoY)",
+            "Anomaly detection (outliers, unusual patterns)",
+            "Data storytelling (executive summaries)",
+            "Conversation memory (multi-turn)",
             "Data visualization recommendations"
         ]
     }

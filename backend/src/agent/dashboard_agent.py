@@ -59,7 +59,8 @@ class DashboardAgentState(TypedDict, total=False):
     dashboard_context: DashboardContext
     
     # Processing
-    intent: str  # chat, capability, dashboard_context, clarification, data_query
+    intent: str  # chat, capability, dashboard_context, clarification, data_query, comparison, anomaly, storytelling
+    query_type: str  # For data queries: 'standard', 'comparison', 'anomaly', 'storytelling'
     context_scope: str  # 'filtered' (use dashboard filters) or 'global' (all data)
     messages: Annotated[List[BaseMessage], add]  # Conversation history
     
@@ -85,7 +86,10 @@ INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly O
 - capability (asking what you can do, help)
 - dashboard_context (asking about current filters, selections, what's shown)
 - clarification (vague question needing more detail: single words like "sales", "profit")
-- data_query (specific data analysis: "top 5 customers", "total sales by region")
+- comparison (comparing time periods, regions, categories: "Q1 vs Q2", "compare East and West", "year over year")
+- anomaly (unusual patterns, outliers: "what's unusual", "anomalies", "outliers", "unexpected")
+- storytelling (narrative summary, presentation: "summarize", "tell me the story", "executive summary")
+- data_query (standard data analysis: "top 5 customers", "total sales by region")
 
 Question: {question}
 Dashboard Context: {context}
@@ -144,6 +148,97 @@ Explicit filtered keywords: "this region", "current filter", "as filtered", "wha
 Question: {question}
 
 Respond with exactly one word: 'filtered' or 'global'"""
+
+
+# Specialized analysis prompts
+COMPARISON_ANALYSIS_PROMPT = """You are analyzing a COMPARISON query. Structure your response as:
+
+## Comparison: {comparison_elements}
+
+### Executive Summary
+[One sentence comparing the key difference]
+
+### Detailed Comparison
+| Metric | {element_1} | {element_2} | Difference | % Change |
+|--------|-------------|-------------|------------|----------|
+[Fill with actual data]
+
+### Key Insights
+1. **Winner:** [Which performed better overall]
+2. **Biggest Gap:** [Where the largest difference exists]
+3. **Trend:** [Is the gap growing or shrinking, if temporal]
+
+### Recommendation
+[Actionable insight based on comparison]
+
+Data: {data}
+Question: {question}
+Filters Applied: {filters}"""
+
+
+ANOMALY_DETECTION_PROMPT = """You are analyzing data for ANOMALIES and OUTLIERS. Structure your response as:
+
+## 🔍 Anomaly Detection Results
+
+### Summary
+[X anomalies found in Y data points]
+
+### Detected Anomalies
+
+| Item | Expected | Actual | Deviation | Severity |
+|------|----------|--------|-----------|----------|
+[List each anomaly with severity: 🔴 High, 🟡 Medium, 🟢 Low]
+
+### Pattern Analysis
+1. **Outliers:** [Data points significantly outside normal range]
+2. **Sudden Changes:** [Unexpected spikes or drops]
+3. **Missing Patterns:** [Expected trends that didn't occur]
+
+### Root Cause Hypotheses
+- [Possible explanation 1]
+- [Possible explanation 2]
+
+### Recommended Actions
+1. [Investigation needed]
+2. [Immediate action if critical]
+
+Data: {data}
+Question: {question}
+Statistical context: Calculate Z-scores, IQR, or percentage deviation as appropriate."""
+
+
+STORYTELLING_PROMPT = """You are creating a DATA STORY / EXECUTIVE SUMMARY. Structure your response as:
+
+## 📊 Dashboard Story: {dashboard_name}
+
+### The Big Picture
+[2-3 sentence executive summary a CEO could understand in 10 seconds]
+
+### Key Headlines
+🎯 **Main Takeaway:** [Single most important insight]
+📈 **Performance:** [Overall trend - up/down/stable]
+⚠️ **Watch Out:** [Key concern or risk]
+💡 **Opportunity:** [Actionable opportunity]
+
+### By The Numbers
+- **{metric_1}:** {value_1} ({trend})
+- **{metric_2}:** {value_2} ({trend})
+- **{metric_3}:** {value_3} ({trend})
+
+### What This Means
+[Narrative explanation connecting the data to business impact]
+
+### Recommended Next Steps
+1. [Action item 1]
+2. [Action item 2]
+3. [Action item 3]
+
+---
+📋 *Report generated from: {dashboard_name}*
+📅 *Filters: {filters}*
+
+Data: {data}
+Dashboard Context: {context}"""
 
 
 # =============================================================================
@@ -227,6 +322,9 @@ class DashboardAgent:
         graph.add_node("handle_context", self._handle_context)
         graph.add_node("handle_clarification", self._handle_clarification)
         graph.add_node("handle_data_query", self._handle_data_query)
+        graph.add_node("handle_comparison", self._handle_comparison)
+        graph.add_node("handle_anomaly", self._handle_anomaly)
+        graph.add_node("handle_storytelling", self._handle_storytelling)
         
         # Entry point
         graph.set_entry_point("classify_intent")
@@ -241,6 +339,9 @@ class DashboardAgent:
                 "dashboard_context": "handle_context",
                 "clarification": "handle_clarification",
                 "data_query": "handle_data_query",
+                "comparison": "handle_comparison",
+                "anomaly": "handle_anomaly",
+                "storytelling": "handle_storytelling",
             }
         )
         
@@ -250,6 +351,9 @@ class DashboardAgent:
         graph.add_edge("handle_context", END)
         graph.add_edge("handle_clarification", END)
         graph.add_edge("handle_data_query", END)
+        graph.add_edge("handle_comparison", END)
+        graph.add_edge("handle_anomaly", END)
+        graph.add_edge("handle_storytelling", END)
         
         return graph
     
@@ -265,6 +369,9 @@ class DashboardAgent:
             "clarification_needed": "clarification",
             "clarification": "clarification",
             "data_query": "data_query",
+            "comparison": "comparison",
+            "anomaly": "anomaly",
+            "storytelling": "storytelling",
         }
         
         return intent_map.get(intent, "data_query")
@@ -340,12 +447,56 @@ class DashboardAgent:
             if question_lower.strip('?!. ') in vague_words:
                 return "clarification"
         
+        # Comparison patterns (before generic data_query)
+        comparison_patterns = [
+            r'compare\s+\w+\s+(to|with|vs|versus|and)\s+\w+',
+            r'\bvs\.?\b',
+            r'\bversus\b',
+            r'(q[1-4]|quarter)\s*(vs|to|and)\s*(q[1-4]|quarter)',
+            r'(year|yoy)\s*(over|on)\s*year',
+            r'compare.*region',
+            r'(difference|differ)\s+(between|from)',
+            r'how does.*compare',
+            r'(this|last)\s+(year|month|quarter).*compare',
+        ]
+        for pattern in comparison_patterns:
+            if re.search(pattern, question_lower):
+                return "comparison"
+        
+        # Anomaly detection patterns
+        anomaly_patterns = [
+            r"what'?s?\s+(unusual|weird|strange|odd|abnormal)",
+            r'(find|detect|show|identify)\s*(the)?\s*(anomal|outlier|unusual)',
+            r'\b(anomal|outlier)s?\b',
+            r'(unexpected|unusual)\s+(pattern|trend|value)',
+            r'(spike|drop|deviation)',
+            r'(something|anything)\s+(wrong|off|unusual)',
+            r'red flags?',
+        ]
+        for pattern in anomaly_patterns:
+            if re.search(pattern, question_lower):
+                return "anomaly"
+        
+        # Storytelling patterns
+        storytelling_patterns = [
+            r'(tell|give)\s+(me)?\s*(the)?\s*(story|narrative)',
+            r'(executive|exec)\s+summary',
+            r'summarize\s+(the|this)?\s*(dashboard|data|view)',
+            r'presentation\s+(bullet|summary)',
+            r'explain\s+(this|the)\s+(dashboard|view)',
+            r'what\s+(is|does)\s+this\s+(dashboard|data)\s+(show|tell)',
+            r'big\s+picture',
+            r'key\s+(takeaway|insight|finding)s?',
+        ]
+        for pattern in storytelling_patterns:
+            if re.search(pattern, question_lower):
+                return "storytelling"
+        
         # Explicit data query patterns
         data_patterns = [
             r'(top|bottom)\s+\d+',
             r'(total|sum|average|avg|count|max|min)\s+',
             r'(trend|over time|by year|by month)',
-            r'(compare|comparison|vs|versus)',
             r'how (much|many)',
             r'what (is|are|was|were) (the|our)',
         ]
@@ -367,7 +518,10 @@ class DashboardAgent:
             response = await self.llm.ainvoke([HumanMessage(content=prompt)])
             intent = response.content.strip().lower()
             
-            valid_intents = ["chat", "capability", "dashboard_context", "clarification", "data_query"]
+            valid_intents = [
+                "chat", "capability", "dashboard_context", "clarification", 
+                "data_query", "comparison", "anomaly", "storytelling"
+            ]
             if intent in valid_intents:
                 return intent
             
@@ -541,6 +695,174 @@ class DashboardAgent:
             logger.error("Data query failed", error=str(e))
             state["error"] = str(e)
             state["analysis"] = f"Error analyzing data: {str(e)}"
+            state["status"] = "error"
+        
+        return state
+    
+    async def _handle_comparison(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Handle comparison queries (Q1 vs Q2, year-over-year, region comparisons)."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        filters = context.get("filters", [])
+        
+        logger.info("Handling comparison query", question=question[:50])
+        state["query_type"] = "comparison"
+        
+        try:
+            # Enhance the question with comparison-specific instructions
+            enhanced_question = f"""{question}
+
+[COMPARISON ANALYSIS REQUIRED]
+This is a comparison query. Please:
+1. Identify the two or more elements being compared
+2. Query data for each element separately if needed
+3. Calculate differences and percentage changes
+4. Structure the response with a clear comparison table
+5. Highlight the winner/better performer
+6. Note the biggest differences"""
+            
+            # Detect scope and execute
+            context_scope = await self._detect_context_scope(question, filters)
+            state["context_scope"] = context_scope
+            
+            filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
+            if filter_context:
+                enhanced_question += f"\n\n[Dashboard Filter Context: {filter_context}]"
+            
+            result = await self.data_agent.execute_data_query(
+                question=enhanced_question,
+                datasource_id=None,
+                filters=filters if context_scope == "filtered" else None
+            )
+            
+            # Map result with comparison badge
+            if result.get("success") and result.get("analysis"):
+                state["analysis"] = f"📊 **Comparison Analysis**\n\n{result.get('analysis', '')}"
+            else:
+                state["analysis"] = result.get("analysis", "")
+            
+            state["results"] = result.get("results")
+            state["visualization"] = result.get("visualization")
+            state["error"] = result.get("error")
+            state["status"] = "complete" if result.get("success") else "error"
+            
+        except Exception as e:
+            logger.error("Comparison query failed", error=str(e))
+            state["error"] = str(e)
+            state["analysis"] = f"Error in comparison analysis: {str(e)}"
+            state["status"] = "error"
+        
+        return state
+    
+    async def _handle_anomaly(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Handle anomaly detection queries (outliers, unusual patterns)."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        filters = context.get("filters", [])
+        
+        logger.info("Handling anomaly detection query", question=question[:50])
+        state["query_type"] = "anomaly"
+        
+        try:
+            # Enhance the question with anomaly detection instructions
+            enhanced_question = f"""{question}
+
+[ANOMALY DETECTION REQUIRED]
+This is an anomaly detection query. Please:
+1. Retrieve relevant data with sufficient rows to detect patterns
+2. Calculate statistical measures (mean, std dev, percentiles)
+3. Identify values that deviate significantly (>2 standard deviations or outside IQR*1.5)
+4. Check for sudden spikes or drops compared to previous periods
+5. Note any missing or unexpected patterns
+6. Rate each anomaly by severity (High/Medium/Low)
+7. Suggest possible root causes"""
+            
+            # Detect scope and execute
+            context_scope = await self._detect_context_scope(question, filters)
+            state["context_scope"] = context_scope
+            
+            filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
+            if filter_context:
+                enhanced_question += f"\n\n[Dashboard Filter Context: {filter_context}]"
+            
+            result = await self.data_agent.execute_data_query(
+                question=enhanced_question,
+                datasource_id=None,
+                filters=filters if context_scope == "filtered" else None
+            )
+            
+            # Map result with anomaly badge
+            if result.get("success") and result.get("analysis"):
+                state["analysis"] = f"🔍 **Anomaly Detection Results**\n\n{result.get('analysis', '')}"
+            else:
+                state["analysis"] = result.get("analysis", "")
+            
+            state["results"] = result.get("results")
+            state["visualization"] = result.get("visualization")
+            state["error"] = result.get("error")
+            state["status"] = "complete" if result.get("success") else "error"
+            
+        except Exception as e:
+            logger.error("Anomaly detection failed", error=str(e))
+            state["error"] = str(e)
+            state["analysis"] = f"Error in anomaly detection: {str(e)}"
+            state["status"] = "error"
+        
+        return state
+    
+    async def _handle_storytelling(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Handle storytelling/narrative queries (executive summaries, presentations)."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        filters = context.get("filters", [])
+        dashboard_name = context.get("dashboard_name", "Dashboard")
+        
+        logger.info("Handling storytelling query", question=question[:50])
+        state["query_type"] = "storytelling"
+        
+        try:
+            # Enhance the question with storytelling instructions
+            filter_context = self._build_filter_context(filters) if filters else "No filters applied"
+            
+            enhanced_question = f"""{question}
+
+[EXECUTIVE SUMMARY / DATA STORY REQUIRED]
+Dashboard: {dashboard_name}
+Filters: {filter_context}
+
+Please create a compelling data story:
+1. Start with "The Big Picture" - 2-3 sentences a CEO could understand in 10 seconds
+2. Identify the main takeaway, overall performance trend, key concern, and opportunity
+3. List 3-5 key metrics with values and trends
+4. Explain what the data means for the business
+5. Provide 3 actionable next steps
+6. Keep it concise but insightful - suitable for an exec presentation"""
+            
+            # Detect scope and execute
+            context_scope = await self._detect_context_scope(question, filters)
+            state["context_scope"] = context_scope
+            
+            result = await self.data_agent.execute_data_query(
+                question=enhanced_question,
+                datasource_id=None,
+                filters=filters if context_scope == "filtered" else None
+            )
+            
+            # Map result with storytelling badge
+            if result.get("success") and result.get("analysis"):
+                state["analysis"] = f"📖 **Dashboard Story: {dashboard_name}**\n\n{result.get('analysis', '')}"
+            else:
+                state["analysis"] = result.get("analysis", "")
+            
+            state["results"] = result.get("results")
+            state["visualization"] = result.get("visualization")
+            state["error"] = result.get("error")
+            state["status"] = "complete" if result.get("success") else "error"
+            
+        except Exception as e:
+            logger.error("Storytelling query failed", error=str(e))
+            state["error"] = str(e)
+            state["analysis"] = f"Error generating story: {str(e)}"
             state["status"] = "error"
         
         return state
