@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.api.routes import router
+from src.api.dashboard_routes import router as dashboard_router
 from src.core.config import settings
 from src.core.exceptions import TableauMCPError
 from src.core.logging import get_logger, setup_logging
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
         
         ## Features
         - Natural Language Queries
+        - Dashboard Agent for Tableau Extension
         - Activity & Usage Tracking
         - Like/Dislike Feedback
         - Analytics Dashboard
@@ -73,8 +75,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     
-    # Routes
+    # Routes - Original API
     app.include_router(router, prefix=settings.api_prefix)
+    
+    # Routes - Dashboard Agent API (for Tableau Extension)
+    app.include_router(dashboard_router, prefix=settings.api_prefix)
     
     # Exception handlers
     @app.exception_handler(TableauMCPError)

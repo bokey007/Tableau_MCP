@@ -128,17 +128,26 @@ async function sendMessage() {
     const loadingId = addLoadingMessage();
     
     try {
-        // Prepare request with dashboard context
+        // Refresh dashboard context before sending
+        await captureDashboardContext();
+        
+        // Prepare request with dashboard context (new Dashboard Agent schema)
         const requestBody = {
             question: message,
             username: 'tableau-extension-user',
-            context: dashboardContext
+            // Dashboard context fields (flattened for new API)
+            dashboard_name: dashboardContext?.name || null,
+            worksheets: dashboardContext?.worksheets || [],
+            filters: dashboardContext?.filters || [],
+            datasources: dashboardContext?.datasources || [],
+            parameters: dashboardContext?.parameters || [],
+            selected_marks: dashboardContext?.selected_marks || []
         };
         
-        log('Sending request', requestBody);
+        log('Sending request to Dashboard Agent', requestBody);
         
-        // Call backend API
-        const response = await fetch(`${CONFIG.API_URL}/query`, {
+        // Call Dashboard Agent API (new endpoint)
+        const response = await fetch(`${CONFIG.API_URL}/dashboard/query`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
