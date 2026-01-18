@@ -44,6 +44,9 @@ class AgentState(TypedDict, total=False):
     # Intent classification
     intent: str  # "data_query" or "chat"
     
+    # Dashboard context (passed from Dashboard Agent)
+    dashboard_filters: Optional[List[Dict[str, Any]]]  # Filters from Tableau dashboard
+    
     # Core query fields
     question: str
     selected_datasource: Optional[Datasource]
@@ -1736,6 +1739,7 @@ Available calculator tools:
         self,
         question: str,
         datasource_id: Optional[str] = None,
+        filters: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Execute a data query WITHOUT intent classification.
@@ -1747,6 +1751,7 @@ Available calculator tools:
         Args:
             question: Natural language question (already classified as data_query)
             datasource_id: Optional datasource ID to use
+            filters: Optional dashboard filters to apply (list of {field, value} dicts)
             
         Returns:
             Result dictionary with analysis and data
@@ -1758,7 +1763,8 @@ Available calculator tools:
                 "error": "Question is too short",
             }
         
-        logger.info("Executing data query (skipping intent classification)", question=question[:50])
+        filters_info = f" with {len(filters)} filters" if filters else ""
+        logger.info(f"Executing data query (skipping intent classification){filters_info}", question=question[:50])
         
         # Build initial state - already marked as data_query
         initial_state: AgentState = {
@@ -1766,6 +1772,7 @@ Available calculator tools:
             "intent": "data_query",  # Pre-set intent (skip classification)
             "status": "started",
             "messages": [HumanMessage(content=question.strip())],
+            "dashboard_filters": filters,  # Pass filters for query planning
         }
         
         if datasource_id:

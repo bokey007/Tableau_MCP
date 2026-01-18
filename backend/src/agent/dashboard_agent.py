@@ -60,6 +60,7 @@ class DashboardAgentState(TypedDict, total=False):
     
     # Processing
     intent: str  # chat, capability, dashboard_context, clarification, data_query
+    context_scope: str  # 'filtered' (use dashboard filters) or 'global' (all data)
     messages: Annotated[List[BaseMessage], add]  # Conversation history
     
     # Output
@@ -120,8 +121,29 @@ Answer the user's question about what's currently shown/selected."""
 CLARIFICATION_SYSTEM = """The user's question is too vague. Ask for clarification with 2-3 specific suggestions.
 Dashboard: {dashboard_name}
 Available data: {datasources}
+Current filters: {filters}
+
+Also ask if they want to:
+1. Search within the current filter context (e.g., "only West region")
+2. Search across all data (global/unfiltered)
 
 Be brief and helpful."""
+
+
+CONTEXT_SCOPE_SYSTEM = """You are analyzing if a user's data query should use dashboard filters or search globally.
+
+Dashboard Filters: {filters}
+
+Based on the question, determine the scope:
+- 'filtered' = Use current dashboard filters (default for most queries)
+- 'global' = Ignore filters, search all data
+
+Explicit global keywords: "all", "across all", "overall", "total", "globally", "ignoring filters", "without filter", "entire dataset"
+Explicit filtered keywords: "this region", "current filter", "as filtered", "what's shown", "in this view"
+
+Question: {question}
+
+Respond with exactly one word: 'filtered' or 'global'"""
 
 
 # =============================================================================
@@ -467,17 +489,36 @@ class DashboardAgent:
         return state
     
     async def _handle_data_query(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Delegate data query to Data Agent (VizQL)."""
+        """Delegate data query to Data Agent (VizQL) with context scope handling."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
+        filters = context.get("filters", [])
         
         logger.info("Delegating to Data Agent", question=question[:50])
         
         try:
-            # Call Data Agent's execute_data_query (skips intent classification)
+            # Detect context scope: filtered (use dashboard filters) or global (all data)
+            context_scope = await self._detect_context_scope(question, filters)
+            state["context_scope"] = context_scope
+            
+            logger.info("Context scope detected", scope=context_scope, filters_count=len(filters))
+            
+            # Build filter context for query enhancement
+            filter_context = None
+            if context_scope == "filtered" and filters:
+                filter_context = self._build_filter_context(filters)
+                logger.info("Applying dashboard filters to query", filter_context=filter_context)
+            
+            # Enhance question with filter context if applicable
+            enhanced_question = question
+            if filter_context:
+                enhanced_question = f"{question}\n\n[Dashboard Filter Context: {filter_context}. Apply these filters to the query.]"
+            
+            # Call Data Agent's execute_data_query
             result = await self.data_agent.execute_data_query(
-                question=question,
-                datasource_id=None
+                question=enhanced_question,
+                datasource_id=None,
+                filters=filters if context_scope == "filtered" else None
             )
             
             # Map result to state
@@ -487,8 +528,13 @@ class DashboardAgent:
             state["error"] = result.get("error")
             state["status"] = "complete" if result.get("success") else "error"
             
-            # Enrich with dashboard context
+            # Enrich with dashboard context (scope indicator)
             if result.get("success") and state.get("analysis"):
+                scope_indicator = "🔍 **Data Scope:** " + (
+                    f"Filtered by {filter_context}" if context_scope == "filtered" and filter_context
+                    else "All data (global)"
+                )
+                state["analysis"] = f"{scope_indicator}\n\n{state['analysis']}"
                 state["analysis"] = self._enrich_with_context(state["analysis"], context)
             
         except Exception as e:
@@ -498,6 +544,60 @@ class DashboardAgent:
             state["status"] = "error"
         
         return state
+    
+    async def _detect_context_scope(self, question: str, filters: List[Dict]) -> str:
+        """
+        Detect whether user wants filtered (dashboard context) or global (all data) results.
+        
+        Returns:
+            'filtered' - Apply dashboard filters to query
+            'global' - Search all data ignoring filters
+        """
+        question_lower = question.lower()
+        
+        # No filters = always global
+        if not filters:
+            return "global"
+        
+        # Heuristic detection first (fast path)
+        
+        # Explicit global keywords
+        global_patterns = [
+            "across all", "all regions", "all categories", "all time",
+            "overall", "total across", "globally", "ignoring filter",
+            "without filter", "entire dataset", "all data", "company-wide",
+            "organization-wide", "regardless of filter"
+        ]
+        for pattern in global_patterns:
+            if pattern in question_lower:
+                return "global"
+        
+        # Explicit filtered keywords
+        filtered_patterns = [
+            "this region", "current filter", "as filtered", "what's shown",
+            "in this view", "with these filters", "selected", "currently applied"
+        ]
+        for pattern in filtered_patterns:
+            if pattern in question_lower:
+                return "filtered"
+        
+        # Default: use filters if they exist (most common use case)
+        # User is viewing filtered dashboard, so they likely want filtered results
+        return "filtered"
+    
+    def _build_filter_context(self, filters: List[Dict]) -> str:
+        """Build a human-readable filter context string."""
+        if not filters:
+            return ""
+        
+        filter_parts = []
+        for f in filters:
+            field = f.get("field", "")
+            value = f.get("value")
+            if field and value:
+                filter_parts.append(f"{field}='{value}'")
+        
+        return ", ".join(filter_parts) if filter_parts else ""
     
     # =========================================================================
     # Helper Methods
