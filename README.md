@@ -1,55 +1,107 @@
 # 🎯 Tableau MCP AI Agent
 
-An AI-powered platform for querying and analyzing Tableau data using natural language. Built with FastAPI, Streamlit, LangGraph, and PostgreSQL.
+An AI-powered platform for querying and analyzing Tableau data using natural language. Built with FastAPI, LangGraph, and VizQL Data Service (MCP).
 
 ## ✨ Features
 
+### Core Capabilities
+
 - **Natural Language Queries**: Ask questions about your Tableau data in plain English
-- **AI-Powered Analysis**: Get automated insights and recommendations from GPT-4
-- **Activity Tracking**: Full audit trail of queries, feedback, and usage
-- **Like/Dislike Feedback**: Rate responses to improve the system
-- **Analytics Dashboard**: Usage statistics and performance metrics
-- **Multi-Datasource Support**: Query across multiple Tableau datasources
+- **AI-Powered Analysis**: Get automated insights and recommendations using GPT-4/Azure OpenAI
+- **VizQL Data Service**: Native Tableau query execution via MCP Server
+- **Multi-turn Conversations**: Follow-up questions with context memory
+- **Smart Visualizations**: Chart.js-powered visualizations with auto-generated charts
+
+### Tableau Extension (NEW)
+
+- **Dashboard Embedded AI**: AI assistant embedded directly in Tableau dashboards
+- **Context-Aware Queries**: Uses dashboard filters, selections, and parameters
+- **Filter Scope Detection**: Intelligently detects if user wants filtered or global data
+- **Markdown Rendering**: Rich formatted responses with tables and code blocks
+- **Conversation Memory**: Multi-turn conversations within the extension
+
+### Activity Tracking
+
+- Full audit trail of queries, feedback, and usage
+- Like/dislike feedback system
+- Analytics dashboard with usage statistics
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Streamlit     │────▶│   FastAPI       │────▶│   Tableau MCP   │
-│   Frontend      │     │   Backend       │     │   Server        │
-│   (Port 8501)   │     │   (Port 8000)   │     │   (Port 3927)   │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │   PostgreSQL    │
-                        │   Database      │
-                        └─────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         TABLEAU CLOUD / SERVER                          │
+│  ┌──────────────────┐                                                    │
+│  │ Tableau Extension│  ←── AI chat embedded in dashboard                │
+│  │ (index.html)     │                                                    │
+│  └────────┬─────────┘                                                    │
+└───────────┼─────────────────────────────────────────────────────────────┘
+            │ HTTPS
+            ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         BACKEND (FastAPI)                                  │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │                    DASHBOARD AGENT (LangGraph)                      │   │
+│  │  • Intent Classification (chat, capability, context, data_query)   │   │
+│  │  • Context Scope Detection (filtered vs global)                    │   │
+│  │  • Conversation Memory (MemorySaver)                               │   │
+│  └────────────────────────────────┬───────────────────────────────────┘   │
+│                                   │                                        │
+│                       ┌───────────▼───────────┐                           │
+│                       │     DATA AGENT        │                           │
+│                       │  (VizQL Orchestrator) │                           │
+│                       │  • Discover → Plan    │                           │
+│                       │  • Review → Execute   │                           │
+│                       │  • Analyze            │                           │
+│                       └───────────┬───────────┘                           │
+│                                   │                                        │
+└───────────────────────────────────┼────────────────────────────────────────┘
+                                    │ HTTP/SSE
+                        ┌───────────▼───────────┐
+                        │     MCP SERVER        │
+                        │  (VizQL Data Service) │
+                        │  • tableau-mcp        │
+                        └───────────┬───────────┘
+                                    │
+                        ┌───────────▼───────────┐
+                        │   TABLEAU CLOUD/      │
+                        │   SERVER API          │
+                        └───────────────────────┘
 ```
 
 ## 📁 Project Structure
 
 ```
 tableau-mcp-agent/
-├── backend/                    # FastAPI Backend
+├── backend/                        # FastAPI Backend
 │   ├── src/
-│   │   ├── agent/              # LangGraph AI Agent
-│   │   ├── api/routes/         # REST API endpoints
-│   │   ├── core/               # Config, logging, exceptions
-│   │   ├── db/                 # SQLAlchemy models & sessions
-│   │   ├── mcp/                # MCP client
-│   │   ├── services/           # Business logic services
-│   │   └── main.py             # FastAPI application
-│   ├── tests/                  # Pytest tests
-│   ├── Dockerfile
-│   └── pyproject.toml          # UV dependencies
-├── frontend/                   # Streamlit Frontend
-│   ├── app.py                  # Main application
-│   ├── pages/                  # Multi-page app
-│   ├── Dockerfile
-│   └── pyproject.toml          # UV dependencies
-├── k8s/                        # Kubernetes manifests
-├── docker-compose.yml          # Development setup
-├── docker-compose.prod.yml     # Production setup
+│   │   ├── agent/
+│   │   │   ├── dashboard_agent.py  # LangGraph Dashboard Agent
+│   │   │   └── graph.py            # Data Agent (VizQL orchestration)
+│   │   ├── api/
+│   │   │   ├── dashboard_routes.py # Tableau Extension API
+│   │   │   └── routes/             # Other REST endpoints
+│   │   ├── core/                   # Config, logging, exceptions
+│   │   ├── db/                     # SQLAlchemy models & sessions
+│   │   ├── mcp/                    # MCP client
+│   │   └── main.py                 # FastAPI application
+│   └── Dockerfile
+│
+├── tableau-extension/              # Tableau Dashboard Extension
+│   ├── ai-analytics-agent.trex    # Extension manifest
+│   ├── src/
+│   │   ├── index.html             # Main extension UI
+│   │   ├── app.js                 # Extension logic
+│   │   ├── styles.css             # Dark theme styling
+│   │   └── demo.html              # Standalone demo for testing
+│   └── README.md                  # Extension documentation
+│
+├── frontend/                       # Streamlit Frontend (alternative UI)
+│   ├── app.py
+│   └── pages/
+│
+├── docker-compose.yml              # Development setup
+├── docker-compose.prod.yml         # Production setup
 └── Makefile
 ```
 
@@ -59,156 +111,191 @@ tableau-mcp-agent/
 
 - Python 3.11+
 - Docker & Docker Compose
-- OpenAI API key
-- Tableau Cloud/Server access with Personal Access Token (PAT)
+- OpenAI API key (or Azure OpenAI)
+- Tableau Cloud/Server with Connected App credentials
 
 ### 1. Clone and Configure
 
 ```bash
-cd tableau-mcp-agent
+git clone <repo-url>
+cd Tableau_MCP
 
-# Copy environment files
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
+# Create environment file
+cp .env.template .env
 
-# Edit backend/.env with your credentials:
-# - OPENAI_API_KEY
+# Edit .env with your credentials:
+# - OPENAI_API_KEY (or Azure OpenAI settings)
 # - TABLEAU_SERVER, TABLEAU_SITE_NAME
-# - TABLEAU_PAT_NAME, TABLEAU_PAT_VALUE
-# - POSTGRES_PASSWORD
+# - TABLEAU_CONNECTED_APP_* credentials
 ```
 
 ### 2. Start with Docker
 
 ```bash
 # Start all services
-docker-compose up --build
+docker compose up -d
 
 # Access the applications:
 # - Streamlit UI: http://localhost:8501
 # - API Docs: http://localhost:8000/docs
+# - Extension Demo: http://localhost:8080/demo.html
 ```
 
-### 3. Local Development (Optional)
+### 3. Start Extension Demo Server
 
 ```bash
-# Install UV if not installed
-pip install uv
-
-# Backend
-cd backend
-uv sync
-uv run uvicorn src.main:app --reload --port 8000
-
-# Frontend (in another terminal)
-cd frontend
-uv sync
-uv run streamlit run app.py
+cd tableau-extension/src
+python3 -m http.server 8080
+# Open http://localhost:8080/demo.html
 ```
 
 ## 📊 API Endpoints
 
-| Endpoint                      | Method | Description                   |
-| ----------------------------- | ------ | ----------------------------- |
-| `/api/v1/query`               | POST   | Submit natural language query |
-| `/api/v1/query/history`       | GET    | Get query history             |
-| `/api/v1/query/{id}`          | GET    | Get specific query details    |
-| `/api/v1/datasources`         | GET    | List available datasources    |
-| `/api/v1/feedback`            | POST   | Submit like/dislike feedback  |
-| `/api/v1/feedback/stats`      | GET    | Get feedback statistics       |
-| `/api/v1/analytics/dashboard` | GET    | Get usage dashboard           |
-| `/api/v1/analytics/report`    | GET    | Generate usage report         |
-| `/api/v1/health`              | GET    | Health check                  |
+### Dashboard Agent (Tableau Extension)
 
-## 🗄️ Database Schema
+| Endpoint                         | Method | Description                     |
+| -------------------------------- | ------ | ------------------------------- |
+| `/api/v1/dashboard/query`        | POST   | Process question from extension |
+| `/api/v1/dashboard/health`       | GET    | Extension health check          |
+| `/api/v1/dashboard/capabilities` | GET    | List available intents          |
 
-| Table              | Description                |
-| ------------------ | -------------------------- |
-| `users`            | User accounts              |
-| `sessions`         | User sessions              |
-| `queries`          | Query history with results |
-| `query_feedback`   | Like/dislike feedback      |
-| `activity_logs`    | Complete audit trail       |
-| `usage_statistics` | Aggregated daily stats     |
+### Data Agent (Direct Queries)
 
-## 🔧 Configuration
+| Endpoint                | Method | Description                   |
+| ----------------------- | ------ | ----------------------------- |
+| `/api/v1/query`         | POST   | Submit natural language query |
+| `/api/v1/query/history` | GET    | Get query history             |
+| `/api/v1/datasources`   | GET    | List available datasources    |
 
-### Environment Variables
+### Analytics & Feedback
 
-| Variable            | Description        | Default             |
-| ------------------- | ------------------ | ------------------- |
-| `OPENAI_API_KEY`    | OpenAI API key     | Required            |
-| `OPENAI_MODEL`      | Model to use       | gpt-4-turbo-preview |
-| `TABLEAU_SERVER`    | Tableau server URL | Required            |
-| `TABLEAU_PAT_NAME`  | PAT name           | Required            |
-| `TABLEAU_PAT_VALUE` | PAT value          | Required            |
-| `POSTGRES_HOST`     | Database host      | localhost           |
-| `POSTGRES_PASSWORD` | Database password  | Required            |
-| `MCP_SERVER_URL`    | MCP server URL     | http://mcp:3927     |
+| Endpoint                      | Method | Description                  |
+| ----------------------------- | ------ | ---------------------------- |
+| `/api/v1/feedback`            | POST   | Submit like/dislike feedback |
+| `/api/v1/analytics/dashboard` | GET    | Usage dashboard              |
+
+## 🔌 Tableau Extension Setup
+
+### 1. Deploy Backend
+
+Deploy the backend to your infrastructure and note the URL.
+
+### 2. Configure Extension
+
+Edit `tableau-extension/src/app.js`:
+
+```javascript
+const CONFIG = {
+    API_URL: 'https://your-backend-url.com/api/v1',
+    ...
+};
+```
+
+### 3. Host Extension Files
+
+Host the extension files (`index.html`, `app.js`, `styles.css`) on HTTPS.
+
+### 4. Update CORS
+
+Add your extension URL to `CORS_ORIGINS` in environment:
+
+```
+CORS_ORIGINS=https://your-tableau-site.tableau.com
+```
+
+### 5. Register in Tableau
+
+1. Open Tableau dashboard
+2. Drag "Extension" object to dashboard
+3. Select "Add from file" → select `.trex` file
+4. IT may need to allow-list the extension URL
+
+## 🧠 Intent Classification
+
+The Dashboard Agent classifies user intents:
+
+| Intent              | Examples                     | Handler                 |
+| ------------------- | ---------------------------- | ----------------------- |
+| `chat`              | "Hello", "Thank you"         | Local response          |
+| `capability`        | "What can you do?"           | Local response          |
+| `dashboard_context` | "What filters are applied?"  | Uses Tableau context    |
+| `clarification`     | "sales" (too vague)          | Asks for clarification  |
+| `data_query`        | "Top 5 customers by revenue" | Delegates to Data Agent |
+
+## 🔍 Context Scope Detection
+
+When filters are active, the agent detects query scope:
+
+| User Says          | Detected Scope | Behavior               |
+| ------------------ | -------------- | ---------------------- |
+| "Top 5 products"   | `filtered`     | Uses dashboard filters |
+| "Show all regions" | `global`       | Ignores filters        |
+| "Overall total"    | `global`       | Queries all data       |
+| "In this view"     | `filtered`     | Uses current filters   |
+
+## 🔧 Environment Variables
+
+| Variable                             | Description                       | Required                 |
+| ------------------------------------ | --------------------------------- | ------------------------ |
+| `OPENAI_API_KEY`                     | OpenAI API key                    | Yes\*                    |
+| `AZURE_OPENAI_API_KEY`               | Azure OpenAI key                  | Yes\*                    |
+| `AZURE_OPENAI_ENDPOINT`              | Azure endpoint                    | For Azure                |
+| `TABLEAU_SERVER`                     | Tableau Cloud/Server URL          | Yes                      |
+| `TABLEAU_CONNECTED_APP_CLIENT_ID`    | Connected App ID                  | Yes                      |
+| `TABLEAU_CONNECTED_APP_SECRET_VALUE` | Connected App Secret              | Yes                      |
+| `CORS_ORIGINS`                       | Allowed origins (comma-separated) | For Extension            |
+| `MCP_SERVER_URL`                     | MCP server URL                    | Default: http://mcp:3927 |
+
+\*Either OpenAI or Azure OpenAI is required
 
 ## 🧪 Testing
 
 ```bash
+# Test the demo (no Tableau required)
+cd tableau-extension/src
+python3 -m http.server 8080
+# Open http://localhost:8080/demo.html
+
+# Run backend tests
 cd backend
-
-# Run tests
 uv run pytest tests/ -v
-
-# With coverage
-uv run pytest tests/ --cov=src --cov-report=html
 ```
 
 ## 🐳 Docker Commands
 
 ```bash
-# Build all images
-make docker-build
-
-# Start services
-make docker-up
+# Start all services
+docker compose up -d
 
 # View logs
-make docker-logs
+docker compose logs -f backend
+
+# Rebuild after code changes
+docker compose build backend && docker compose up -d backend
 
 # Stop services
-make docker-down
-
-# Clean up
-make docker-clean
+docker compose down
 ```
 
-## ☸️ Kubernetes Deployment
+## 📈 Features Breakdown
 
-```bash
-# Deploy to Kubernetes
-make k8s-deploy
+### Visualization Support
 
-# Check status
-make k8s-status
+- Automatic chart type detection (bar, line, pie)
+- Chart.js rendering in extension
+- Markdown tables for data preview
 
-# View logs
-make k8s-logs
+### Conversation Memory
 
-# Delete deployment
-make k8s-delete
-```
+- Multi-turn conversations
+- Thread ID for session continuity
+- Follow-up questions (e.g., "What about last year?")
 
-## 📈 Activity Tracking
-
-The platform tracks:
-
-- ✅ Every query with timestamps
-- ✅ Query execution times and row counts
-- ✅ Like/dislike feedback with ratings
-- ✅ Written comments and suggestions
-- ✅ User activity history
-- ✅ Aggregated usage statistics
-
-## 🔒 Security
+### Security
 
 - Non-root Docker containers
-- Secrets managed via environment variables
-- CORS configuration for frontend
+- CORS configuration
+- Connected App authentication for Tableau
 - Input validation on all endpoints
 
 ## 📝 License
@@ -218,7 +305,7 @@ MIT License - see LICENSE file for details.
 ## 🤝 Contributing
 
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch (`git checkout -b feature/tableau-extension`)
 3. Make your changes
 4. Run tests
 5. Submit a pull request

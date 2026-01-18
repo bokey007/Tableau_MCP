@@ -1,130 +1,158 @@
 # Tableau Extension: AI Analytics Agent
 
-A Tableau Dashboard Extension that provides an AI-powered natural language interface for data analysis.
+A Tableau Dashboard Extension that provides an AI-powered natural language interface for data analysis, embedded directly in your Tableau dashboards.
+
+## ✨ Features
+
+- **Natural Language Queries**: Ask questions in plain English
+- **Dashboard Context Awareness**: Uses current filters, selections, and parameters
+- **Context Scope Detection**: Intelligently detects filtered vs global queries
+- **Markdown Rendering**: Rich formatted responses with tables and code blocks
+- **Chart Visualizations**: Chart.js powered visualizations
+- **Conversation Memory**: Multi-turn conversations with follow-up support
+- **Dark Theme UI**: Modern aesthetic matching Tableau
 
 ## 📁 Project Structure
 
 ```
 tableau-extension/
 ├── ai-analytics-agent.trex    # Extension manifest (register with Tableau)
+├── icons/                     # Extension icons
 ├── src/
 │   ├── index.html             # Main extension UI
-│   ├── styles.css             # Styling
-│   └── app.js                 # Application logic
-└── README.md                  # This file
+│   ├── app.js                 # Application logic (Chart.js, marked.js)
+│   ├── styles.css             # Dark theme styling
+│   └── demo.html              # Standalone demo (no Tableau required)
+└── README.md
 ```
 
-## 🚀 Deployment
+## 🚀 Quick Start (Demo Mode)
+
+Test the extension without Tableau:
+
+```bash
+cd src
+python3 -m http.server 8080
+# Open http://localhost:8080/demo.html
+```
+
+This uses a simulated dashboard context with filters for testing.
+
+## 🔌 Deployment
 
 ### Prerequisites
 
-1. **Backend API**: The main Tableau MCP Agent must be deployed and accessible
-2. **HTTPS**: Extension must be served over HTTPS (required by Tableau)
-3. **Tableau Cloud Access**: Site Admin access to allow-list the extension
+1. **Backend API**: The Tableau MCP Agent backend must be deployed
+2. **HTTPS**: Extension files must be served over HTTPS
+3. **Tableau Cloud/Server**: Admin access to allow-list extension
 
-### Step 1: Update Configuration
+### Step 1: Configure API URL
 
-Edit `src/app.js` and update the `CONFIG` object:
+Edit `src/app.js`:
 
 ```javascript
 const CONFIG = {
-  API_URL: "https://your-ares-domain.company.com/api/v1",
+  API_URL: "https://your-backend-url.com/api/v1",
   TIMEOUT: 120000,
-  DEBUG: false, // Set to false in production
+  DEBUG: false,
 };
 ```
 
 ### Step 2: Update Manifest
 
-Edit `ai-analytics-agent.trex` and update the source URL:
+Edit `ai-analytics-agent.trex`:
 
 ```xml
 <source-location>
-    <url>https://your-ares-domain.company.com/extension/index.html</url>
+    <url>https://your-extension-host.com/index.html</url>
 </source-location>
 ```
 
 ### Step 3: Deploy Extension Files
 
-Deploy the `src/` folder contents to a web server accessible via HTTPS:
+Host `src/` contents on HTTPS-enabled web server:
 
 ```bash
-# Example: Copy to ARES static hosting
-scp -r src/* user@ares-server:/var/www/extension/
+# Files needed:
+# - index.html
+# - app.js
+# - styles.css
 ```
 
-### Step 4: Allow-list in Tableau Cloud
+### Step 4: Configure CORS
+
+Add your Tableau domain to backend's `CORS_ORIGINS`:
+
+```
+CORS_ORIGINS=https://your-tableau-site.tableau.com
+```
+
+### Step 5: Allow-list in Tableau
 
 1. Log in to Tableau Cloud as Site Admin
 2. Go to **Settings** → **Extensions**
-3. Under "Enable Specific Extensions", add:
-   ```
-   https://your-ares-domain.company.com/extension/
-   ```
+3. Under "Enable Specific Extensions", add extension URL
 4. Save changes
 
-### Step 5: Add to Dashboard
+### Step 6: Add to Dashboard
 
-1. Open a Tableau dashboard in edit mode
-2. Drag an **Extension** object onto the dashboard
-3. Click "Access Local Extensions"
-4. Upload `ai-analytics-agent.trex`
-5. The extension will load and connect to your backend
+1. Open Tableau dashboard in edit mode
+2. Drag **Extension** object onto dashboard
+3. Click "Add from file" → select `.trex` file
+4. Extension loads and connects to backend
 
-## 🧪 Local Development
+## 🧠 Intent Classification
 
-For local testing without HTTPS:
+| Intent              | Examples                    | Behavior               |
+| ------------------- | --------------------------- | ---------------------- |
+| `chat`              | "Hello", "Thanks"           | Friendly response      |
+| `capability`        | "What can you do?"          | Lists capabilities     |
+| `dashboard_context` | "What filters are applied?" | Shows current context  |
+| `clarification`     | "sales" (vague)             | Asks for clarification |
+| `data_query`        | "Top 5 products by sales"   | Executes VizQL query   |
 
-1. Start a local web server:
+## 🔍 Context Scope Detection
 
-   ```bash
-   cd src
-   python -m http.server 8080
-   ```
+| User Question        | Scope    | Behavior               |
+| -------------------- | -------- | ---------------------- |
+| "Top 5 products"     | Filtered | Uses dashboard filters |
+| "Show all regions"   | Global   | Ignores filters        |
+| "In this view"       | Filtered | Uses current filters   |
+| "Company-wide total" | Global   | Queries all data       |
 
-2. Update the manifest to use localhost:
+## 🎨 UI Components
 
-   ```xml
-   <url>http://localhost:8080/index.html</url>
-   ```
+| Component | Library     | Purpose               |
+| --------- | ----------- | --------------------- |
+| Markdown  | marked.js   | Render formatted text |
+| Charts    | Chart.js    | Render visualizations |
+| Tables    | Native HTML | Data preview          |
 
-3. In Tableau Desktop, enable unsigned extensions:
+## 🔧 Configuration
 
-   - Help → Settings and Performance → Enable Debugging
-
-4. Load the extension from the local `.trex` file
-
-## 🔧 Configuration Options
-
-| Setting   | Description            | Default                        |
-| --------- | ---------------------- | ------------------------------ |
-| `API_URL` | Backend API endpoint   | `http://localhost:8000/api/v1` |
-| `TIMEOUT` | Request timeout (ms)   | `120000`                       |
-| `DEBUG`   | Enable console logging | `true`                         |
-
-## 📊 Features
-
-- **Natural Language Queries**: Ask questions in plain English
-- **Dashboard Context**: Automatically captures current filters and datasources
-- **Data Preview**: Shows tabular data preview in chat
-- **Visualization Recommendations**: Suggests appropriate chart types
-- **Dark Theme**: Matches Tableau's modern aesthetic
-
-## 🔒 Security Notes
-
-1. **CORS**: Backend must allow requests from your extension domain
-2. **Authentication**: Uses Tableau's built-in authentication context
-3. **PHI Handling**: Queries containing PHI are sanitized before logging
+| Setting   | Description          | Default                        |
+| --------- | -------------------- | ------------------------------ |
+| `API_URL` | Backend API endpoint | `http://localhost:8000/api/v1` |
+| `TIMEOUT` | Request timeout (ms) | `120000`                       |
+| `DEBUG`   | Console logging      | `true`                         |
 
 ## 🐛 Troubleshooting
 
-| Issue                         | Solution                                     |
-| ----------------------------- | -------------------------------------------- |
-| "Extension not allowed"       | Ensure URL is in Tableau allow-list          |
-| "Connection error"            | Check if backend API is accessible           |
-| CORS errors                   | Add extension domain to backend CORS_ORIGINS |
-| "Tableau API not initialized" | Ensure running inside Tableau dashboard      |
+| Issue                   | Solution                               |
+| ----------------------- | -------------------------------------- |
+| "Extension not allowed" | Add URL to Tableau allow-list          |
+| CORS errors             | Add extension domain to `CORS_ORIGINS` |
+| "Connection error"      | Check backend is running               |
+| No charts               | Ensure Chart.js CDN loads              |
+| No markdown             | Ensure marked.js CDN loads             |
+
+## 🔒 Security
+
+- CORS configured for specific origins
+- Uses Tableau's authentication context
+- No sensitive data stored in browser
+- PHI sanitized before logging
 
 ## 📝 License
 
-Internal use only. Part of the GenAI Tableau MCP project.
+MIT License - Part of the Tableau MCP AI Agent project.

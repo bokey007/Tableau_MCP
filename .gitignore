@@ -96,3 +96,12 @@ credentials/
 # Local development
 local/
 data/
+
+# Generated exports and regression data
+*.xlsx
+*.xls
+regression_data_*.xlsx
+export_*.csv
+
+# Gemini/AI artifacts
+.gemini/
