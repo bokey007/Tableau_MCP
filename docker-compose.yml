@@ -63,7 +63,16 @@ services:
     ports:
       - "3927:3927"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "-O", "-", "http://localhost:3927/tableau-mcp"]
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "--spider",
+          "-O",
+          "-",
+          "http://localhost:3927/tableau-mcp",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -90,7 +99,7 @@ services:
       BACKEND_HOST: "0.0.0.0"
       BACKEND_PORT: "8000"
       API_PREFIX: /api/v1
-      CORS_ORIGINS: "http://localhost:8501,http://localhost:3000"
+      CORS_ORIGINS: "http://localhost:8501,http://localhost:3000,http://localhost:8080"
 
       # Database
       POSTGRES_HOST: postgres
