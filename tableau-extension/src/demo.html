@@ -5,6 +5,70 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Analytics Agent - Standalone Demo</title>
     <link rel="stylesheet" href="styles.css" />
+    <!-- Markdown parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Chart.js for visualizations -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      /* Markdown content styling */
+      .message-content h1, .message-content h2, .message-content h3 {
+        margin-top: 12px;
+        margin-bottom: 8px;
+        color: var(--text-primary);
+      }
+      .message-content h3 { font-size: 14px; }
+      .message-content h2 { font-size: 15px; }
+      .message-content h1 { font-size: 16px; }
+      .message-content ul, .message-content ol {
+        margin: 8px 0 8px 20px;
+        padding: 0;
+      }
+      .message-content li { margin: 4px 0; }
+      .message-content p { margin: 8px 0; }
+      .message-content strong { color: var(--primary-color); }
+      .message-content code {
+        background: var(--surface-light);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+      .message-content pre {
+        background: var(--surface-light);
+        padding: 12px;
+        border-radius: 8px;
+        overflow-x: auto;
+        margin: 8px 0;
+      }
+      .message-content pre code {
+        background: none;
+        padding: 0;
+      }
+      .message-content table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 12px 0;
+        font-size: 12px;
+      }
+      .message-content th, .message-content td {
+        padding: 8px;
+        border: 1px solid var(--border-color);
+        text-align: left;
+      }
+      .message-content th {
+        background: var(--surface-light);
+      }
+      /* Chart container */
+      .chart-container {
+        background: var(--surface);
+        border-radius: 12px;
+        padding: 16px;
+        margin: 12px 0;
+        max-width: 500px;
+      }
+      .chart-container canvas {
+        max-height: 300px;
+      }
+    </style>
   </head>
   <body>
     <div class="extension-container">
@@ -178,10 +242,15 @@
           if (data.success !== false) {
             // Show intent badge
             const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || "unknown"}</span>`;
-            addMessage(
-              intentBadge + (data.analysis || "Response received."),
-              "assistant",
-            );
+            
+            // Parse markdown for better formatting
+            const analysisHtml = parseMarkdown(data.analysis || "Response received.");
+            addMessage(intentBadge + analysisHtml, "assistant");
+
+            // Show visualization if available
+            if (data.visualization) {
+              renderVisualization(data.visualization, data.results?.data);
+            }
 
             // Show data preview if available
             if (data.results?.data && data.results.data.length > 0) {
@@ -198,6 +267,89 @@
             "assistant",
           );
         }
+      }
+
+      // Parse markdown to HTML
+      function parseMarkdown(text) {
+        if (!text) return "";
+        try {
+          // Use marked.js if available
+          if (typeof marked !== 'undefined') {
+            return marked.parse(text);
+          }
+        } catch (e) {
+          console.warn("Markdown parsing failed:", e);
+        }
+        // Fallback: basic formatting
+        return text
+          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+      }
+
+      // Render visualization (chart)
+      function renderVisualization(vizConfig, data) {
+        if (!vizConfig || !vizConfig.type) return;
+        
+        log("Rendering visualization", vizConfig);
+        
+        const container = document.getElementById("chatContainer");
+        const chartId = "chart-" + Date.now();
+        
+        // Create chart container
+        const chartDiv = document.createElement("div");
+        chartDiv.className = "message assistant";
+        chartDiv.innerHTML = `
+          <div class="message-content">
+            <div class="chart-container">
+              <canvas id="${chartId}"></canvas>
+            </div>
+          </div>
+        `;
+        container.appendChild(chartDiv);
+        container.scrollTop = container.scrollHeight;
+        
+        // Wait for DOM and render chart
+        setTimeout(() => {
+          const ctx = document.getElementById(chartId);
+          if (!ctx || typeof Chart === 'undefined') return;
+          
+          try {
+            new Chart(ctx, {
+              type: vizConfig.type || 'bar',
+              data: {
+                labels: vizConfig.labels || [],
+                datasets: vizConfig.datasets || [{
+                  label: vizConfig.label || 'Data',
+                  data: vizConfig.values || [],
+                  backgroundColor: [
+                    '#4a90d9', '#48bb78', '#fc8181', '#f6ad55', '#9f7aea',
+                    '#4fd1c5', '#f687b3', '#68d391', '#63b3ed', '#fbd38d'
+                  ],
+                  borderColor: 'rgba(255,255,255,0.1)',
+                  borderWidth: 1
+                }]
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                  legend: { labels: { color: '#a0aec0' } },
+                  title: {
+                    display: !!vizConfig.title,
+                    text: vizConfig.title || '',
+                    color: '#ffffff'
+                  }
+                },
+                scales: vizConfig.type === 'pie' || vizConfig.type === 'doughnut' ? {} : {
+                  x: { ticks: { color: '#a0aec0' }, grid: { color: '#2d3748' } },
+                  y: { ticks: { color: '#a0aec0' }, grid: { color: '#2d3748' } }
+                }
+              }
+            });
+          } catch (e) {
+            log("Chart rendering failed", e);
+          }
+        }, 100);
       }
 
       function addMessage(content, role) {
