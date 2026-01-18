@@ -1,22 +1,34 @@
 # =============================================================================
-# Dashboard Agent - Master Orchestrator for Tableau Extension
+# Dashboard Agent - LangGraph-Based Master Orchestrator
 # =============================================================================
 """
-Dashboard Agent that serves as the entry point for the Tableau Extension.
-It handles routing between:
-- Chat/Greeting responses (handled locally)
-- Dashboard context queries (answered from Tableau context)
-- Clarification requests (ambiguous questions)
-- Data queries (delegated to Data Agent)
+Dashboard Agent using LangGraph for the Tableau Extension.
+Leverages LangGraph's StateGraph for routing and MemorySaver for conversation memory.
+
+Architecture:
+    User Question → classify_intent → route_by_intent
+                                         │
+              ┌──────────┬───────────────┼───────────────┬──────────────┐
+              ▼          ▼               ▼               ▼              ▼
+           [chat]  [capability]  [dashboard_context] [clarify]    [data_query]
+              │          │               │               │              │
+              └──────────┴───────────────┴───────────────┴──────────────┘
+                                         │
+                                         ▼
+                                       [END]
 """
 
-import json
 import re
-from typing import Any, Dict, List, Optional, TypedDict
+import uuid
+import asyncio
+from typing import Any, Dict, List, Optional, Annotated, TypedDict
 from datetime import datetime
+from operator import add
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.core.config import settings
 from src.core.logging import get_logger
@@ -26,7 +38,7 @@ logger = get_logger(__name__)
 
 
 # =============================================================================
-# State Definition
+# State Definition (LangGraph Native)
 # =============================================================================
 
 class DashboardContext(TypedDict, total=False):
@@ -40,116 +52,107 @@ class DashboardContext(TypedDict, total=False):
 
 
 class DashboardAgentState(TypedDict, total=False):
-    """State for the Dashboard Agent."""
+    """LangGraph state for Dashboard Agent."""
+    # Input
     question: str
+    username: str
     dashboard_context: DashboardContext
-    intent: str  # chat, context, clarification, data_query
+    
+    # Processing
+    intent: str  # chat, capability, dashboard_context, clarification, data_query
+    messages: Annotated[List[BaseMessage], add]  # Conversation history
+    
+    # Output
     response: str
-    data: List[Dict[str, Any]]
-    visualization: Dict[str, Any]
+    analysis: str
+    results: Optional[Dict[str, Any]]
+    visualization: Optional[Dict[str, Any]]
+    needs_clarification: bool
+    
+    # Metadata
+    status: str
     error: Optional[str]
+    processing_time_ms: float
 
 
 # =============================================================================
-# Intent Classification Prompts
+# Prompts
 # =============================================================================
 
-INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for a Tableau dashboard AI assistant.
+INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly ONE word from:
+- chat (greetings, thanks, casual conversation)
+- capability (asking what you can do, help)
+- dashboard_context (asking about current filters, selections, what's shown)
+- clarification (vague question needing more detail: single words like "sales", "profit")
+- data_query (specific data analysis: "top 5 customers", "total sales by region")
 
-The user is viewing a Tableau dashboard and has asked a question. Classify the intent into one of these categories:
+Question: {question}
+Dashboard Context: {context}
 
-1. **chat** - Greetings, thanks, pleasantries, or general conversation
-   Examples: "Hello", "Hi there", "Thanks!", "How are you?", "Goodbye"
-
-2. **capability** - Questions about what the assistant can do
-   Examples: "What can you do?", "Help me", "How do I use this?", "What features do you have?"
-
-3. **dashboard_context** - Questions about current dashboard state, filters, or what's visible
-   Examples: "What filter is applied?", "What's currently selected?", "Which region am I looking at?", "What data is shown?"
-
-4. **clarification_needed** - Vague or ambiguous questions that need more detail
-   Examples: "sales", "show me data", "analyze this", "what about customers?"
-
-5. **data_query** - Specific data analysis questions that need to query the datasource
-   Examples: "What are total sales?", "Top 5 customers by revenue", "Sales trend since 2020", "Compare regions"
-
-Current Dashboard Context:
-{context}
-
-User Question: {question}
-
-Respond with ONLY one of: chat, capability, dashboard_context, clarification_needed, data_query
-"""
+Intent:"""
 
 
-CHAT_RESPONSE_PROMPT = """You are a friendly AI assistant embedded in a Tableau dashboard. The user has sent a conversational message.
-
-User message: {question}
-
-Respond naturally and briefly. If greeted, respond warmly and offer to help analyze the dashboard data.
-Keep your response to 1-2 sentences maximum."""
+CHAT_RESPONSE_SYSTEM = """You are a friendly AI analytics assistant embedded in a Tableau dashboard. 
+Keep responses brief (1-2 sentences). Be warm and helpful."""
 
 
-CAPABILITY_RESPONSE_PROMPT = """You are an AI assistant embedded in a Tableau dashboard. Explain your capabilities briefly.
-
-Current dashboard: {dashboard_name}
+CAPABILITY_RESPONSE_SYSTEM = """You are an AI analytics assistant in a Tableau dashboard. Explain your capabilities briefly.
 Available datasources: {datasources}
+Current dashboard: {dashboard_name}
 
-User asked: {question}
-
-Explain that you can:
-- Answer questions about the data in natural language
-- Analyze trends, comparisons, and aggregations
-- Explain what filters are currently applied
+You can:
+- Answer data questions in natural language
+- Analyze trends, aggregations, comparisons
+- Explain current filters and selections
 - Help understand the dashboard
 
-Keep response to 3-4 sentences maximum."""
+Keep response to 3-4 sentences."""
 
 
-CONTEXT_RESPONSE_PROMPT = """You are an AI assistant embedded in a Tableau dashboard. Answer questions about the current dashboard state.
-
-Dashboard Name: {dashboard_name}
-
-Current Filters Applied:
-{filters}
-
-Worksheets in Dashboard:
-{worksheets}
-
-User Question: {question}
-
-Provide a clear, concise answer about the current dashboard state."""
-
-
-CLARIFICATION_PROMPT = """You are an AI assistant embedded in a Tableau dashboard. The user's question is too vague to answer directly.
-
+CONTEXT_RESPONSE_SYSTEM = """You are an AI assistant explaining the current dashboard state.
 Dashboard: {dashboard_name}
-Available data topics: {datasources}
+Active Filters: {filters}
+Worksheets: {worksheets}
 
-User's vague question: "{question}"
+Answer the user's question about what's currently shown/selected."""
 
-Ask a clarifying question to understand what they want. Suggest 2-3 specific options they might mean.
-Keep response brief and helpful."""
+
+CLARIFICATION_SYSTEM = """The user's question is too vague. Ask for clarification with 2-3 specific suggestions.
+Dashboard: {dashboard_name}
+Available data: {datasources}
+
+Be brief and helpful."""
 
 
 # =============================================================================
-# Dashboard Agent Implementation
+# Dashboard Agent (LangGraph Implementation)
 # =============================================================================
 
 class DashboardAgent:
     """
-    Master orchestrator for Tableau Extension.
+    LangGraph-based Dashboard Agent for Tableau Extension.
     
-    Routes requests between:
-    - Local handling (chat, context, clarification)
-    - Data Agent delegation (complex data queries)
+    Uses LangGraph's StateGraph for workflow management and MemorySaver
+    for multi-turn conversation support.
     """
     
+    # Class-level checkpointer (shared for conversation memory)
+    _checkpointer = None
+    
     def __init__(self):
-        """Initialize the Dashboard Agent."""
+        """Initialize the Dashboard Agent with LangGraph."""
         self._llm = None
         self._data_agent = None
-        logger.info("Dashboard Agent initialized")
+        self._compiled_graph = None
+        logger.info("Dashboard Agent (LangGraph) initialized")
+    
+    @classmethod
+    def get_checkpointer(cls) -> MemorySaver:
+        """Get or create shared checkpointer for conversation memory."""
+        if cls._checkpointer is None:
+            cls._checkpointer = MemorySaver()
+            logger.info("Initialized Dashboard Agent MemorySaver")
+        return cls._checkpointer
     
     @property
     def llm(self):
@@ -182,83 +185,96 @@ class DashboardAgent:
             self._data_agent = TableauAgent()
         return self._data_agent
     
-    async def process(
-        self,
-        question: str,
-        dashboard_context: Optional[DashboardContext] = None,
-        username: str = "dashboard_user"
-    ) -> Dict[str, Any]:
-        """
-        Main entry point for processing user questions.
+    @property
+    def graph(self):
+        """Get compiled LangGraph (lazy initialization)."""
+        if self._compiled_graph is None:
+            workflow = self._build_graph()
+            self._compiled_graph = workflow.compile(checkpointer=self.get_checkpointer())
+            logger.info("Dashboard Agent graph compiled")
+        return self._compiled_graph
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow for Dashboard Agent."""
+        graph = StateGraph(DashboardAgentState)
         
-        Args:
-            question: User's natural language question
-            dashboard_context: Context from Tableau dashboard (filters, worksheets, etc.)
-            username: User identifier
-            
-        Returns:
-            Response dict with analysis, data, and visualization info
-        """
-        start_time = datetime.now()
-        context = dashboard_context or {}
+        # Add nodes
+        graph.add_node("classify_intent", self._classify_intent)
+        graph.add_node("handle_chat", self._handle_chat)
+        graph.add_node("handle_capability", self._handle_capability)
+        graph.add_node("handle_context", self._handle_context)
+        graph.add_node("handle_clarification", self._handle_clarification)
+        graph.add_node("handle_data_query", self._handle_data_query)
         
-        logger.info(
-            "Processing dashboard question",
-            question=question[:50],
-            has_context=bool(context)
+        # Entry point
+        graph.set_entry_point("classify_intent")
+        
+        # Conditional routing based on intent
+        graph.add_conditional_edges(
+            "classify_intent",
+            self._route_by_intent,
+            {
+                "chat": "handle_chat",
+                "capability": "handle_capability",
+                "dashboard_context": "handle_context",
+                "clarification": "handle_clarification",
+                "data_query": "handle_data_query",
+            }
         )
         
-        try:
-            # Step 1: Classify intent
-            intent = await self._classify_intent(question, context)
-            logger.info("Intent classified", intent=intent)
-            
-            # Step 2: Route based on intent
-            if intent == "chat":
-                result = await self._handle_chat(question)
-                
-            elif intent == "capability":
-                result = await self._handle_capability(question, context)
-                
-            elif intent == "dashboard_context":
-                result = await self._handle_context_query(question, context)
-                
-            elif intent == "clarification_needed":
-                result = await self._handle_clarification(question, context)
-                
-            elif intent == "data_query":
-                # Delegate to Data Agent
-                result = await self._delegate_to_data_agent(question, context, username)
-                
-            else:
-                # Default to data query
-                result = await self._delegate_to_data_agent(question, context, username)
-            
-            # Add metadata
-            result["intent"] = intent
-            result["processing_time_ms"] = (datetime.now() - start_time).total_seconds() * 1000
-            
-            return result
-            
-        except Exception as e:
-            logger.error("Dashboard Agent error", error=str(e))
-            return {
-                "success": False,
-                "error": str(e),
-                "intent": "error",
-                "analysis": f"I encountered an error processing your request: {str(e)}"
-            }
-    
-    async def _classify_intent(
-        self,
-        question: str,
-        context: DashboardContext
-    ) -> str:
-        """Classify user intent using heuristics first, then LLM if needed."""
+        # All handlers go to END
+        graph.add_edge("handle_chat", END)
+        graph.add_edge("handle_capability", END)
+        graph.add_edge("handle_context", END)
+        graph.add_edge("handle_clarification", END)
+        graph.add_edge("handle_data_query", END)
         
+        return graph
+    
+    def _route_by_intent(self, state: DashboardAgentState) -> str:
+        """Route to appropriate handler based on classified intent."""
+        intent = state.get("intent", "data_query")
+        
+        # Map intent to node name
+        intent_map = {
+            "chat": "chat",
+            "capability": "capability",
+            "dashboard_context": "dashboard_context",
+            "clarification_needed": "clarification",
+            "clarification": "clarification",
+            "data_query": "data_query",
+        }
+        
+        return intent_map.get(intent, "data_query")
+    
+    # =========================================================================
+    # Node Implementations
+    # =========================================================================
+    
+    async def _classify_intent(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Classify user intent using heuristics + LLM fallback."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
         question_lower = question.lower().strip()
         
-        # Quick heuristic checks for common patterns
+        logger.info("Classifying intent", question=question[:50])
+        
+        # Add user message to conversation history
+        state["messages"] = [HumanMessage(content=question)]
+        
+        # Heuristic classification (fast path)
+        intent = self._classify_by_heuristics(question_lower)
+        
+        if intent is None:
+            # LLM fallback for ambiguous cases
+            intent = await self._classify_by_llm(question, context)
+        
+        state["intent"] = intent
+        logger.info("Intent classified", intent=intent)
+        return state
+    
+    def _classify_by_heuristics(self, question_lower: str) -> Optional[str]:
+        """Fast heuristic classification for common patterns."""
         
         # Chat patterns
         chat_patterns = [
@@ -296,19 +312,18 @@ class DashboardAgent:
             if re.search(pattern, question_lower):
                 return "dashboard_context"
         
-        # Very short/vague queries that need clarification
+        # Clarification needed (very short/vague)
         if len(question_lower.split()) <= 2:
             vague_words = ['sales', 'profit', 'revenue', 'customers', 'data', 'show', 'analyze']
             if question_lower.strip('?!. ') in vague_words:
-                return "clarification_needed"
+                return "clarification"
         
-        # Data query patterns (explicit)
+        # Explicit data query patterns
         data_patterns = [
             r'(top|bottom)\s+\d+',
             r'(total|sum|average|avg|count|max|min)\s+',
             r'(trend|over time|by year|by month)',
             r'(compare|comparison|vs|versus)',
-            r'(sales|profit|revenue|quantity)\s+(by|for|in)',
             r'how (much|many)',
             r'what (is|are|was|were) (the|our)',
         ]
@@ -316,265 +331,276 @@ class DashboardAgent:
             if re.search(pattern, question_lower):
                 return "data_query"
         
-        # If no heuristic matched, use LLM for classification
+        return None  # Needs LLM classification
+    
+    async def _classify_by_llm(self, question: str, context: DashboardContext) -> str:
+        """Use LLM for ambiguous intent classification."""
         try:
-            context_str = self._format_context_for_prompt(context)
+            context_str = self._format_context_summary(context)
             prompt = INTENT_CLASSIFIER_PROMPT.format(
-                context=context_str,
-                question=question
+                question=question,
+                context=context_str
             )
             
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are an intent classifier. Respond with exactly one word."),
-                HumanMessage(content=prompt)
-            ])
-            
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
             intent = response.content.strip().lower()
             
-            # Validate response
-            valid_intents = ["chat", "capability", "dashboard_context", "clarification_needed", "data_query"]
+            valid_intents = ["chat", "capability", "dashboard_context", "clarification", "data_query"]
             if intent in valid_intents:
                 return intent
             
-            # Default to data_query if LLM gives unexpected response
-            return "data_query"
+            return "data_query"  # Default
             
         except Exception as e:
-            logger.warning("LLM intent classification failed, defaulting to data_query", error=str(e))
+            logger.warning("LLM classification failed", error=str(e))
             return "data_query"
     
-    async def _handle_chat(self, question: str) -> Dict[str, Any]:
+    async def _handle_chat(self, state: DashboardAgentState) -> DashboardAgentState:
         """Handle casual conversation."""
+        question = state.get("question", "")
+        
         try:
             response = await self.llm.ainvoke([
-                SystemMessage(content="You are a friendly AI assistant. Keep responses very brief (1-2 sentences)."),
-                HumanMessage(content=CHAT_RESPONSE_PROMPT.format(question=question))
+                SystemMessage(content=CHAT_RESPONSE_SYSTEM),
+                HumanMessage(content=question)
             ])
             
-            return {
-                "success": True,
-                "analysis": response.content,
-                "results": None,
-                "visualization": None
-            }
+            state["analysis"] = response.content
+            state["status"] = "complete"
+            state["messages"] = [AIMessage(content=response.content)]
+            
         except Exception as e:
-            return {
-                "success": True,
-                "analysis": "Hello! I'm here to help you analyze your dashboard data. What would you like to know?",
-                "results": None,
-                "visualization": None
-            }
+            state["analysis"] = "Hello! I'm here to help you analyze your dashboard data. What would you like to know?"
+            state["status"] = "complete"
+        
+        return state
     
-    async def _handle_capability(
-        self,
-        question: str,
-        context: DashboardContext
-    ) -> Dict[str, Any]:
-        """Explain capabilities with dashboard awareness."""
+    async def _handle_capability(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Explain agent capabilities."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
         
         dashboard_name = context.get("dashboard_name", "your dashboard")
-        datasources = [ds.get("name", "Unknown") for ds in context.get("datasources", [])]
-        datasources_str = ", ".join(datasources) if datasources else "connected datasources"
-        
-        prompt = CAPABILITY_RESPONSE_PROMPT.format(
-            dashboard_name=dashboard_name,
-            datasources=datasources_str,
-            question=question
-        )
+        datasources = [ds.get("name", "data") for ds in context.get("datasources", [])]
         
         try:
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are a helpful AI assistant. Be concise."),
-                HumanMessage(content=prompt)
-            ])
-            
-            return {
-                "success": True,
-                "analysis": response.content,
-                "results": None,
-                "visualization": None
-            }
-        except Exception as e:
-            return {
-                "success": True,
-                "analysis": f"I can help you analyze the data in {dashboard_name}. Ask me questions like 'What are total sales?' or 'Show me the top 5 customers'. I can also explain what filters are currently applied.",
-                "results": None,
-                "visualization": None
-            }
-    
-    async def _handle_context_query(
-        self,
-        question: str,
-        context: DashboardContext
-    ) -> Dict[str, Any]:
-        """Answer questions about current dashboard state."""
-        
-        dashboard_name = context.get("dashboard_name", "Dashboard")
-        
-        # Format filters
-        filters = context.get("filters", [])
-        if filters:
-            filters_str = "\n".join([
-                f"- {f.get('field', 'Unknown')}: {f.get('value', 'All')}"
-                for f in filters
-            ])
-        else:
-            filters_str = "No filters currently applied"
-        
-        # Format worksheets
-        worksheets = context.get("worksheets", [])
-        if worksheets:
-            worksheets_str = ", ".join([w.get("name", "Unknown") for w in worksheets])
-        else:
-            worksheets_str = "Unknown"
-        
-        prompt = CONTEXT_RESPONSE_PROMPT.format(
-            dashboard_name=dashboard_name,
-            filters=filters_str,
-            worksheets=worksheets_str,
-            question=question
-        )
-        
-        try:
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are an AI assistant explaining dashboard state. Be specific and helpful."),
-                HumanMessage(content=prompt)
-            ])
-            
-            return {
-                "success": True,
-                "analysis": response.content,
-                "results": None,
-                "visualization": None,
-                "dashboard_state": {
-                    "filters": filters,
-                    "worksheets": worksheets
-                }
-            }
-        except Exception as e:
-            # Fallback to simple response
-            return {
-                "success": True,
-                "analysis": f"You're viewing '{dashboard_name}'. {filters_str}.",
-                "results": None,
-                "visualization": None
-            }
-    
-    async def _handle_clarification(
-        self,
-        question: str,
-        context: DashboardContext
-    ) -> Dict[str, Any]:
-        """Ask for clarification on vague questions."""
-        
-        dashboard_name = context.get("dashboard_name", "your dashboard")
-        datasources = [ds.get("name", "Unknown") for ds in context.get("datasources", [])]
-        datasources_str = ", ".join(datasources) if datasources else "your data"
-        
-        prompt = CLARIFICATION_PROMPT.format(
-            dashboard_name=dashboard_name,
-            datasources=datasources_str,
-            question=question
-        )
-        
-        try:
-            response = await self.llm.ainvoke([
-                SystemMessage(content="You are a helpful AI assistant. Ask clarifying questions briefly."),
-                HumanMessage(content=prompt)
-            ])
-            
-            return {
-                "success": True,
-                "analysis": response.content,
-                "results": None,
-                "visualization": None,
-                "needs_clarification": True
-            }
-        except Exception as e:
-            return {
-                "success": True,
-                "analysis": f"Could you be more specific? For example, you could ask:\n- 'What are total sales?'\n- 'Top 5 customers by revenue'\n- 'Sales trend by month'",
-                "results": None,
-                "visualization": None,
-                "needs_clarification": True
-            }
-    
-    async def _delegate_to_data_agent(
-        self,
-        question: str,
-        context: DashboardContext,
-        username: str
-    ) -> Dict[str, Any]:
-        """
-        Delegate data query to the Data Agent.
-        
-        Uses execute_data_query() which skips intent classification since
-        Dashboard Agent has already classified this as a data_query.
-        """
-        
-        logger.info("Delegating to Data Agent (VizQL)", question=question[:50])
-        
-        try:
-            # Call execute_data_query - skips intent classification
-            # Dashboard Agent already determined this is a data_query
-            result = await self.data_agent.execute_data_query(
-                question=question,
-                datasource_id=None,  # Let Data Agent discover datasources
+            system_prompt = CAPABILITY_RESPONSE_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                datasources=", ".join(datasources) if datasources else "connected datasources"
             )
             
-            # Enrich response with dashboard context
-            enriched_result = self._enrich_with_context(result, context)
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=question)
+            ])
             
-            return enriched_result
+            state["analysis"] = response.content
+            state["status"] = "complete"
             
         except Exception as e:
-            logger.error("Data Agent delegation failed", error=str(e))
+            state["analysis"] = f"I can help analyze data in {dashboard_name}. Ask questions like 'Top 5 customers' or 'Sales trend by month'."
+            state["status"] = "complete"
+        
+        return state
+    
+    async def _handle_context(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Answer questions about dashboard state."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        
+        dashboard_name = context.get("dashboard_name", "Dashboard")
+        filters = context.get("filters", [])
+        worksheets = context.get("worksheets", [])
+        
+        filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
+        worksheets_str = ", ".join([w.get("name", "") for w in worksheets]) if worksheets else "Unknown"
+        
+        try:
+            system_prompt = CONTEXT_RESPONSE_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                filters=filters_str,
+                worksheets=worksheets_str
+            )
+            
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=question)
+            ])
+            
+            state["analysis"] = response.content
+            state["status"] = "complete"
+            
+        except Exception as e:
+            state["analysis"] = f"Dashboard: {dashboard_name}. Filters: {filters_str}."
+            state["status"] = "complete"
+        
+        return state
+    
+    async def _handle_clarification(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Ask for clarification on vague questions."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        
+        dashboard_name = context.get("dashboard_name", "your dashboard")
+        datasources = [ds.get("name", "") for ds in context.get("datasources", [])]
+        
+        try:
+            system_prompt = CLARIFICATION_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                datasources=", ".join(datasources) if datasources else "your data"
+            )
+            
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"User said: '{question}'")
+            ])
+            
+            state["analysis"] = response.content
+            state["needs_clarification"] = True
+            state["status"] = "complete"
+            
+        except Exception as e:
+            state["analysis"] = "Could you be more specific? Try: 'Total sales by region' or 'Top 5 customers'"
+            state["needs_clarification"] = True
+            state["status"] = "complete"
+        
+        return state
+    
+    async def _handle_data_query(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Delegate data query to Data Agent (VizQL)."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        
+        logger.info("Delegating to Data Agent", question=question[:50])
+        
+        try:
+            # Call Data Agent's execute_data_query (skips intent classification)
+            result = await self.data_agent.execute_data_query(
+                question=question,
+                datasource_id=None
+            )
+            
+            # Map result to state
+            state["analysis"] = result.get("analysis", "")
+            state["results"] = result.get("results")
+            state["visualization"] = result.get("visualization")
+            state["error"] = result.get("error")
+            state["status"] = "complete" if result.get("success") else "error"
+            
+            # Enrich with dashboard context
+            if result.get("success") and state.get("analysis"):
+                state["analysis"] = self._enrich_with_context(state["analysis"], context)
+            
+        except Exception as e:
+            logger.error("Data query failed", error=str(e))
+            state["error"] = str(e)
+            state["analysis"] = f"Error analyzing data: {str(e)}"
+            state["status"] = "error"
+        
+        return state
+    
+    # =========================================================================
+    # Helper Methods
+    # =========================================================================
+    
+    def _format_context_summary(self, context: DashboardContext) -> str:
+        """Format context for LLM prompts."""
+        if not context:
+            return "No dashboard context"
+        
+        parts = []
+        if context.get("dashboard_name"):
+            parts.append(f"Dashboard: {context['dashboard_name']}")
+        if context.get("filters"):
+            filters = [f"{f.get('field')}={f.get('value', 'All')}" for f in context["filters"]]
+            parts.append(f"Filters: {', '.join(filters)}")
+        
+        return "; ".join(parts) if parts else "Minimal context"
+    
+    def _enrich_with_context(self, analysis: str, context: DashboardContext) -> str:
+        """Add filter context to analysis."""
+        filters = context.get("filters", [])
+        if not filters:
+            return analysis
+        
+        filter_parts = [f"{f.get('field')}={f.get('value')}" for f in filters if f.get('value')]
+        if filter_parts:
+            return f"{analysis}\n\n📋 **Dashboard Context:** Filtered by: {', '.join(filter_parts)}"
+        
+        return analysis
+    
+    # =========================================================================
+    # Public API
+    # =========================================================================
+    
+    async def process(
+        self,
+        question: str,
+        dashboard_context: Optional[DashboardContext] = None,
+        username: str = "dashboard_user",
+        thread_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a question through the LangGraph workflow.
+        
+        Args:
+            question: User's natural language question
+            dashboard_context: Context from Tableau dashboard
+            username: User identifier
+            thread_id: Optional thread ID for conversation continuity
+            
+        Returns:
+            Response dict with analysis, data, and metadata
+        """
+        start_time = datetime.now()
+        
+        # Build initial state
+        initial_state: DashboardAgentState = {
+            "question": question.strip(),
+            "username": username,
+            "dashboard_context": dashboard_context or {},
+            "status": "started",
+            "needs_clarification": False,
+        }
+        
+        # Thread for conversation memory
+        effective_thread_id = thread_id or str(uuid.uuid4())
+        config = {"configurable": {"thread_id": effective_thread_id}}
+        
+        try:
+            # Run the LangGraph workflow
+            final_state = await asyncio.wait_for(
+                self.graph.ainvoke(initial_state, config=config),
+                timeout=240  # 4 minute timeout
+            )
+            
+            processing_time = (datetime.now() - start_time).total_seconds() * 1000
+            
+            return {
+                "success": final_state.get("status") == "complete",
+                "intent": final_state.get("intent"),
+                "analysis": final_state.get("analysis"),
+                "results": final_state.get("results"),
+                "visualization": final_state.get("visualization"),
+                "needs_clarification": final_state.get("needs_clarification", False),
+                "error": final_state.get("error"),
+                "processing_time_ms": processing_time,
+                "thread_id": effective_thread_id,
+            }
+            
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "error": "Request timed out",
+                "analysis": "The request took too long. Please try a simpler question.",
+            }
+        except Exception as e:
+            logger.exception("Dashboard Agent error", error=str(e))
             return {
                 "success": False,
                 "error": str(e),
-                "analysis": f"I encountered an error while analyzing the data: {str(e)}"
+                "analysis": f"Error: {str(e)}",
             }
-    
-    def _enrich_with_context(
-        self,
-        result: Dict[str, Any],
-        context: DashboardContext
-    ) -> Dict[str, Any]:
-        """Enrich Data Agent response with dashboard context."""
-        
-        # Add filter context to analysis if filters are applied
-        filters = context.get("filters", [])
-        if filters and result.get("success") and result.get("analysis"):
-            filter_note = "\n\n📋 **Dashboard Context:** "
-            filter_parts = [f"{f.get('field')} = {f.get('value')}" for f in filters if f.get('value')]
-            if filter_parts:
-                filter_note += f"Currently filtered by: {', '.join(filter_parts)}"
-                result["analysis"] = result["analysis"] + filter_note
-        
-        return result
-    
-    def _format_context_for_prompt(self, context: DashboardContext) -> str:
-        """Format dashboard context for LLM prompts."""
-        if not context:
-            return "No dashboard context available"
-        
-        parts = []
-        
-        if context.get("dashboard_name"):
-            parts.append(f"Dashboard: {context['dashboard_name']}")
-        
-        if context.get("filters"):
-            filters_str = ", ".join([
-                f"{f.get('field')}={f.get('value', 'All')}"
-                for f in context["filters"]
-            ])
-            parts.append(f"Filters: {filters_str}")
-        
-        if context.get("datasources"):
-            ds_names = [ds.get("name") for ds in context["datasources"]]
-            parts.append(f"Datasources: {', '.join(ds_names)}")
-        
-        return "; ".join(parts) if parts else "Dashboard context minimal"
 
 
 # =============================================================================
