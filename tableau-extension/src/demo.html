@@ -102,16 +102,26 @@
           <div class="message-content">
             Hello! I'm an AI analytics assistant. This is a
             <strong>standalone demo</strong> that doesn't require Tableau.<br /><br />
-            Try asking me:
+            Try these query types:
             <ul style="margin: 8px 0 0 16px; padding: 0">
-              <li>"Hello" (chat)</li>
-              <li>"What can you do?" (capability)</li>
-              <li>"What filters are applied?" (context)</li>
-              <li>"sales" (clarification)</li>
-              <li>"Top 5 products by sales" (data query)</li>
+              <li>📊 <strong>Comparison:</strong> "Compare Q1 vs Q2 sales"</li>
+              <li>🔍 <strong>Anomaly:</strong> "What's unusual in this data?"</li>
+              <li>📖 <strong>Storytelling:</strong> "Summarize this dashboard"</li>
+              <li>📈 <strong>Data:</strong> "Top 5 products by sales"</li>
             </ul>
           </div>
         </div>
+      </div>
+
+      <!-- Quick Actions -->
+      <div id="quickActions" style="padding: 8px 16px; display: flex; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--border-color);">
+        <button onclick="quickQuery('Compare Q1 vs Q2 sales')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📊 Compare</button>
+        <button onclick="quickQuery('What anomalies or unusual patterns are in this data?')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">🔍 Anomalies</button>
+        <button onclick="quickQuery('Give me an executive summary of this dashboard')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📖 Summary</button>
+        <button onclick="quickQuery('Top 5 products by sales')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📈 Top 5</button>
+        <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-secondary);">
+          <input type="checkbox" id="streamingMode" checked style="width: 14px; height: 14px;"> Stream
+        </label>
       </div>
 
       <!-- Input Area -->
@@ -137,7 +147,7 @@
           </button>
         </div>
         <div class="input-hint">
-          Press Enter to send • Powered by AI • Demo Mode
+          Press Enter to send • Streaming enabled • Demo Mode
         </div>
       </div>
     </div>
@@ -170,6 +180,12 @@
         datasources: [{ name: "Sample - Superstore", id: "superstore-001" }],
       };
 
+      // Quick query helper
+      function quickQuery(query) {
+        document.getElementById("userInput").value = query;
+        sendMessage();
+      }
+
       // Initialize
       document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("userInput").focus();
@@ -184,7 +200,7 @@
             }
           });
 
-        log("Demo mode initialized - Conversation memory enabled");
+        log("Demo mode initialized - Streaming & Conversation memory enabled");
       });
 
       async function sendMessage() {
@@ -197,14 +213,132 @@
         addMessage(message, "user");
         messageCount++;
 
-        const loadingId = addLoadingMessage();
+        const useStreaming = document.getElementById("streamingMode").checked;
+        
+        if (useStreaming) {
+          await sendMessageWithStreaming(message);
+        } else {
+          await sendMessageStandard(message);
+        }
+      }
+
+      // SSE Streaming mode
+      async function sendMessageWithStreaming(message) {
+        const loadingId = addLoadingMessage("🤔 Thinking...");
 
         try {
-          // Build request with simulated context and thread_id for conversation memory
           const requestBody = {
             question: message,
             username: "demo-user",
-            thread_id: sessionThreadId,  // Include thread_id for follow-up context
+            thread_id: sessionThreadId,
+            dashboard_name: DEMO_CONTEXT.dashboard_name,
+            worksheets: DEMO_CONTEXT.worksheets,
+            filters: DEMO_CONTEXT.filters,
+            datasources: DEMO_CONTEXT.datasources,
+          };
+
+          log("Sending streaming request", { question: message });
+
+          const response = await fetch(`${CONFIG.API_URL}/dashboard/query/stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+          });
+
+          if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            
+            // Process complete SSE events
+            const lines = buffer.split("\n\n");
+            buffer = lines.pop(); // Keep incomplete event
+            
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const eventData = JSON.parse(line.slice(6));
+                  handleStreamEvent(eventData, loadingId);
+                } catch (e) {
+                  log("Parse error", e);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          log("Streaming failed", err);
+          removeMessage(loadingId);
+          addMessage(`Connection error: ${err.message}`, "assistant");
+        }
+      }
+
+      function handleStreamEvent(event, loadingId) {
+        log("Stream event", event);
+        
+        if (event.event === "thinking") {
+          updateLoadingMessage(loadingId, "🤔 " + event.message);
+        } else if (event.event === "querying") {
+          updateLoadingMessage(loadingId, "🔄 " + event.message);
+        } else if (event.event === "analyzing") {
+          updateLoadingMessage(loadingId, "📊 " + event.message);
+        } else if (event.event === "complete" || event.event === "error") {
+          removeMessage(loadingId);
+          const data = event.data;
+          
+          // Store thread_id
+          if (data.thread_id && !sessionThreadId) {
+            sessionThreadId = data.thread_id;
+          }
+          updateStatus();
+          
+          if (data.success !== false) {
+            const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || "unknown"}</span>`;
+            const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
+              ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
+              : '';
+            const analysisHtml = parseMarkdown(data.analysis || "Response received.");
+            addMessage(intentBadge + queryTypeBadge + analysisHtml, "assistant");
+            
+            if (data.visualization && data.results?.data) {
+              renderVisualization(data.visualization, data.results.data);
+            }
+            if (data.results?.data?.length > 0) {
+              addDataPreview(data.results.data);
+            }
+          } else {
+            addMessage(`Error: ${data.error || "Unknown error"}`, "assistant");
+          }
+        }
+      }
+
+      function updateLoadingMessage(id, text) {
+        const el = document.getElementById(id);
+        if (el) {
+          el.querySelector('.message-content').innerHTML = `<div style="display: flex; align-items: center; gap: 8px;">${text}</div>`;
+        }
+      }
+
+      function updateStatus() {
+        document.getElementById("connectionStatus").textContent = 
+          `Connected • Session active (${messageCount} messages)`;
+      }
+
+      // Standard (non-streaming) mode
+      async function sendMessageStandard(message) {
+        const loadingId = addLoadingMessage();
+
+        try {
+          const requestBody = {
+            question: message,
+            username: "demo-user",
+            thread_id: sessionThreadId,
             dashboard_name: DEMO_CONTEXT.dashboard_name,
             worksheets: DEMO_CONTEXT.worksheets,
             filters: DEMO_CONTEXT.filters,
@@ -414,13 +548,17 @@
         container.scrollTop = container.scrollHeight;
       }
 
-      function addLoadingMessage() {
+      function addLoadingMessage(customText = null) {
         const container = document.getElementById("chatContainer");
         const div = document.createElement("div");
         const id = "loading-" + Date.now();
         div.id = id;
         div.className = "message assistant loading";
-        div.innerHTML = `<div class="message-content"><div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div></div>`;
+        if (customText) {
+          div.innerHTML = `<div class="message-content"><div style="display: flex; align-items: center; gap: 8px;">${customText}</div></div>`;
+        } else {
+          div.innerHTML = `<div class="message-content"><div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div></div>`;
+        }
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
         return id;
