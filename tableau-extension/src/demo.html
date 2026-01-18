@@ -286,11 +286,55 @@
           .replace(/\n/g, '<br>');
       }
 
-      // Render visualization (chart)
+      // Render visualization (chart) from backend config + data
       function renderVisualization(vizConfig, data) {
-        if (!vizConfig || !vizConfig.type) return;
+        // Backend returns: { chart_type, x_axis, y_axis, reason }
+        // We need to transform this + data into Chart.js format
         
-        log("Rendering visualization", vizConfig);
+        if (!vizConfig || !data || !data.length) {
+          log("Cannot render visualization - missing config or data", { vizConfig, dataLength: data?.length });
+          return;
+        }
+        
+        log("Rendering visualization", { vizConfig, dataRows: data.length });
+        
+        // Get chart type (backend uses chart_type, frontend expects type)
+        const chartType = vizConfig.chart_type || vizConfig.type || 'bar';
+        
+        // Extract labels and values from data using vizConfig's axis definitions
+        const xAxis = vizConfig.x_axis || Object.keys(data[0])[0];
+        const yAxis = vizConfig.y_axis || Object.keys(data[0])[1];
+        
+        // Clean axis names (remove aggregation wrappers like SUM(), AVG())
+        const xAxisClean = xAxis.replace(/^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i, '$2');
+        const yAxisClean = yAxis.replace(/^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i, '$2');
+        
+        // Find matching columns in data (case-insensitive, partial match)
+        const findColumn = (axis) => {
+          const axisLower = axis.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const keys = Object.keys(data[0]);
+          return keys.find(k => {
+            const keyLower = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+            return keyLower.includes(axisLower) || axisLower.includes(keyLower);
+          }) || keys[0];
+        };
+        
+        const labelKey = findColumn(xAxisClean);
+        const valueKey = findColumn(yAxisClean);
+        
+        log("Chart axes mapped", { xAxis, yAxis, labelKey, valueKey });
+        
+        // Extract labels and values (limit to 10 for readability)
+        const chartData = data.slice(0, 10);
+        const labels = chartData.map(row => {
+          const val = row[labelKey];
+          // Truncate long labels
+          return typeof val === 'string' && val.length > 25 ? val.substring(0, 22) + '...' : val;
+        });
+        const values = chartData.map(row => {
+          const val = row[valueKey];
+          return typeof val === 'number' ? val : parseFloat(val) || 0;
+        });
         
         const container = document.getElementById("chatContainer");
         const chartId = "chart-" + Date.now();
@@ -303,6 +347,9 @@
             <div class="chart-container">
               <canvas id="${chartId}"></canvas>
             </div>
+            <div style="font-size: 11px; color: var(--text-secondary); margin-top: 8px;">
+              📊 ${chartType.toUpperCase()} chart: ${yAxisClean} by ${xAxisClean}
+            </div>
           </div>
         `;
         container.appendChild(chartDiv);
@@ -311,41 +358,47 @@
         // Wait for DOM and render chart
         setTimeout(() => {
           const ctx = document.getElementById(chartId);
-          if (!ctx || typeof Chart === 'undefined') return;
+          if (!ctx || typeof Chart === 'undefined') {
+            log("Chart.js not available");
+            return;
+          }
           
           try {
             new Chart(ctx, {
-              type: vizConfig.type || 'bar',
+              type: chartType === 'bar' ? 'bar' : chartType,
               data: {
-                labels: vizConfig.labels || [],
-                datasets: vizConfig.datasets || [{
-                  label: vizConfig.label || 'Data',
-                  data: vizConfig.values || [],
+                labels: labels,
+                datasets: [{
+                  label: yAxisClean,
+                  data: values,
                   backgroundColor: [
                     '#4a90d9', '#48bb78', '#fc8181', '#f6ad55', '#9f7aea',
                     '#4fd1c5', '#f687b3', '#68d391', '#63b3ed', '#fbd38d'
                   ],
-                  borderColor: 'rgba(255,255,255,0.1)',
+                  borderColor: 'rgba(255,255,255,0.2)',
                   borderWidth: 1
                 }]
               },
               options: {
                 responsive: true,
                 maintainAspectRatio: true,
+                indexAxis: chartType === 'horizontalBar' ? 'y' : 'x',
                 plugins: {
-                  legend: { labels: { color: '#a0aec0' } },
+                  legend: { display: false },
                   title: {
-                    display: !!vizConfig.title,
-                    text: vizConfig.title || '',
-                    color: '#ffffff'
+                    display: true,
+                    text: `${yAxisClean} by ${xAxisClean}`,
+                    color: '#ffffff',
+                    font: { size: 13 }
                   }
                 },
-                scales: vizConfig.type === 'pie' || vizConfig.type === 'doughnut' ? {} : {
-                  x: { ticks: { color: '#a0aec0' }, grid: { color: '#2d3748' } },
+                scales: chartType === 'pie' || chartType === 'doughnut' ? {} : {
+                  x: { ticks: { color: '#a0aec0', maxRotation: 45 }, grid: { color: '#2d3748' } },
                   y: { ticks: { color: '#a0aec0' }, grid: { color: '#2d3748' } }
                 }
               }
             });
+            log("Chart rendered successfully");
           } catch (e) {
             log("Chart rendering failed", e);
           }
