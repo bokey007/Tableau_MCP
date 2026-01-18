@@ -45,6 +45,7 @@ class DashboardQueryRequest(BaseModel):
     """Request from Tableau Extension."""
     question: str = Field(..., description="User's natural language question")
     username: str = Field(default="extension_user", description="User identifier")
+    thread_id: Optional[str] = Field(default=None, description="Thread ID for conversation memory (multi-turn)")
     
     # Dashboard context from Tableau
     dashboard_name: Optional[str] = Field(default=None, description="Name of the dashboard")
@@ -66,6 +67,7 @@ class DashboardQueryResponse(BaseModel):
     processing_time_ms: Optional[float] = None
     needs_clarification: Optional[bool] = None
     dashboard_state: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None  # For conversation continuity
 
 
 # =============================================================================
@@ -115,7 +117,8 @@ async def dashboard_query(request: DashboardQueryRequest) -> DashboardQueryRespo
         result = await agent.process(
             question=request.question,
             dashboard_context=context,
-            username=request.username
+            username=request.username,
+            thread_id=request.thread_id  # Pass thread_id for conversation memory
         )
         
         return DashboardQueryResponse(**result)

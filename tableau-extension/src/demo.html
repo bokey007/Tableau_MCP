@@ -88,6 +88,10 @@
         DEBUG: true,
       };
 
+      // Session state - maintains conversation memory
+      let sessionThreadId = null;  // Will be set after first response
+      let messageCount = 0;
+
       // Simulated dashboard context (in real Extension, this comes from Tableau API)
       const DEMO_CONTEXT = {
         dashboard_name: "Sales Dashboard",
@@ -116,7 +120,7 @@
             }
           });
 
-        log("Demo mode initialized");
+        log("Demo mode initialized - Conversation memory enabled");
       });
 
       async function sendMessage() {
@@ -127,21 +131,23 @@
 
         input.value = "";
         addMessage(message, "user");
+        messageCount++;
 
         const loadingId = addLoadingMessage();
 
         try {
-          // Build request with simulated context
+          // Build request with simulated context and thread_id for conversation memory
           const requestBody = {
             question: message,
             username: "demo-user",
+            thread_id: sessionThreadId,  // Include thread_id for follow-up context
             dashboard_name: DEMO_CONTEXT.dashboard_name,
             worksheets: DEMO_CONTEXT.worksheets,
             filters: DEMO_CONTEXT.filters,
             datasources: DEMO_CONTEXT.datasources,
           };
 
-          log("Sending request", requestBody);
+          log("Sending request", { ...requestBody, thread_id: sessionThreadId || "(new session)" });
 
           const response = await fetch(`${CONFIG.API_URL}/dashboard/query`, {
             method: "POST",
@@ -153,6 +159,19 @@
 
           const data = await response.json();
           log("Response", data);
+
+          // Store thread_id for conversation continuity
+          if (data.thread_id && !sessionThreadId) {
+            sessionThreadId = data.thread_id;
+            log("Session started", { thread_id: sessionThreadId.substring(0, 8) + "..." });
+            // Update status to show conversation is active
+            document.getElementById("connectionStatus").textContent = 
+              `Connected • Session active (${messageCount} messages)`;
+          } else if (sessionThreadId) {
+            // Update message count
+            document.getElementById("connectionStatus").textContent = 
+              `Connected • Session active (${messageCount} messages)`;
+          }
 
           removeMessage(loadingId);
 
