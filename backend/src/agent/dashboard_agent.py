@@ -505,16 +505,21 @@ class DashboardAgent:
         context: DashboardContext,
         username: str
     ) -> Dict[str, Any]:
-        """Delegate data query to the existing Data Agent."""
+        """
+        Delegate data query to the Data Agent.
         
-        logger.info("Delegating to Data Agent", question=question[:50])
+        Uses execute_data_query() which skips intent classification since
+        Dashboard Agent has already classified this as a data_query.
+        """
+        
+        logger.info("Delegating to Data Agent (VizQL)", question=question[:50])
         
         try:
-            # Call the Data Agent
-            result = await self.data_agent.query(
+            # Call execute_data_query - skips intent classification
+            # Dashboard Agent already determined this is a data_query
+            result = await self.data_agent.execute_data_query(
                 question=question,
-                thread_id=None,  # Generate new thread
-                username=username
+                datasource_id=None,  # Let Data Agent discover datasources
             )
             
             # Enrich response with dashboard context

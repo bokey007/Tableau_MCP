@@ -478,6 +478,45 @@ class TableauAgent:
         
         return graph
     
+    def _build_data_query_graph(self) -> StateGraph:
+        """
+        Build a VizQL-focused graph that skips intent classification.
+        
+        This is used when Dashboard Agent has already classified intent as data_query.
+        The workflow starts directly at 'discover' without re-classifying.
+        """
+        graph = StateGraph(AgentState)
+        
+        # Add only data query nodes (no chat/clarification)
+        graph.add_node("discover", self._discover_datasources)
+        graph.add_node("plan", self._plan_query)
+        graph.add_node("review", self._review_query)
+        graph.add_node("execute", self._execute_query)
+        graph.add_node("analyze", self._analyze_results)
+        
+        # Start directly at discover (skip intent classification)
+        graph.set_entry_point("discover")
+        
+        # Same workflow as main graph
+        graph.add_conditional_edges(
+            "discover",
+            self._check_discovery_outcome,
+        )
+        graph.add_edge("plan", "review")
+        
+        graph.add_conditional_edges(
+            "review",
+            self._check_review_outcome,
+        )
+        
+        graph.add_conditional_edges(
+            "execute",
+            self._should_analyze,
+        )
+        graph.add_edge("analyze", END)
+        
+        return graph
+    
     def _route_by_intent(self, state: AgentState) -> str:
         """Route based on classified intent."""
         intent = state.get("intent", "data_query")
@@ -1691,6 +1730,110 @@ Available calculator tools:
                 "success": False,
                 "question": question,
                 "error": f"Agent execution failed: {e}",
+            }
+    
+    async def execute_data_query(
+        self,
+        question: str,
+        datasource_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a data query WITHOUT intent classification.
+        
+        This method is used by Dashboard Agent when it has already classified
+        the intent as data_query. It skips the intent classification step and
+        goes directly to datasource discovery → query planning → execution.
+        
+        Args:
+            question: Natural language question (already classified as data_query)
+            datasource_id: Optional datasource ID to use
+            
+        Returns:
+            Result dictionary with analysis and data
+        """
+        if not question or len(question.strip()) < 3:
+            return {
+                "success": False,
+                "question": question,
+                "error": "Question is too short",
+            }
+        
+        logger.info("Executing data query (skipping intent classification)", question=question[:50])
+        
+        # Build initial state - already marked as data_query
+        initial_state: AgentState = {
+            "question": question.strip(),
+            "intent": "data_query",  # Pre-set intent (skip classification)
+            "status": "started",
+            "messages": [HumanMessage(content=question.strip())],
+        }
+        
+        if datasource_id:
+            initial_state["selected_datasource"] = Datasource(
+                id=datasource_id,
+                name=datasource_id,
+            )
+        
+        # Build and compile the data-query-specific graph
+        data_query_graph = self._build_data_query_graph()
+        compiled_graph = data_query_graph.compile(checkpointer=self.get_checkpointer())
+        
+        # Thread ID for this execution
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Timeout
+        QUERY_TIMEOUT_SECONDS = 240
+        
+        try:
+            final_state = await asyncio.wait_for(
+                compiled_graph.ainvoke(initial_state, config=config),
+                timeout=QUERY_TIMEOUT_SECONDS
+            )
+            
+            result_data = None
+            analyzed_data = None
+            
+            if final_state.get("query_result"):
+                qr = final_state["query_result"]
+                result_data = {
+                    "row_count": qr.row_count,
+                    "data": qr.data,
+                    "execution_time_ms": qr.execution_time_ms,
+                }
+            
+            if final_state.get("analyzed_data"):
+                analyzed_data = final_state["analyzed_data"]
+            
+            return {
+                "success": final_state.get("status") == "complete" and not final_state.get("error"),
+                "question": question,
+                "datasource": {
+                    "id": final_state.get("selected_datasource").id,
+                    "name": final_state.get("selected_datasource").name,
+                } if final_state.get("selected_datasource") else None,
+                "analysis": final_state.get("analysis"),
+                "query": final_state.get("vizql_query"),
+                "results": result_data,
+                "analyzed_data": analyzed_data,
+                "visualization": final_state.get("visualization"),
+                "error": final_state.get("error"),
+            }
+            
+        except asyncio.TimeoutError:
+            logger.error("Data query timed out", question=question[:50])
+            return {
+                "success": False,
+                "question": question,
+                "error": f"Query timed out after {QUERY_TIMEOUT_SECONDS} seconds.",
+            }
+            
+        except Exception as e:
+            logger.exception("Data query execution failed", error=str(e))
+            return {
+                "success": False,
+                "question": question,
+                "error": f"Query execution failed: {e}",
             }
     
     async def close(self) -> None:
