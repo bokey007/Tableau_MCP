@@ -87,10 +87,26 @@
       <div class="chat-container" id="chatContainer">
         <div class="message assistant">
           <div class="message-content">
-            Hello! I can help you analyze your data. Ask me anything about your
-            dashboard.
+            Hello! I can help you analyze your data. Try these:
+            <ul style="margin: 6px 0 0 16px; padding: 0; font-size: 12px;">
+              <li>📊 <strong>Compare</strong> periods or regions</li>
+              <li>🔍 <strong>Find anomalies</strong> or outliers</li>
+              <li>📖 <strong>Summarize</strong> this dashboard</li>
+              <li>📈 <strong>Top N</strong> products/customers</li>
+            </ul>
           </div>
         </div>
+      </div>
+
+      <!-- Quick Actions -->
+      <div id="quickActions" style="padding: 6px 12px; display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--border-color);">
+        <button onclick="quickQuery('Compare Q1 vs Q2')" style="padding: 3px 10px; font-size: 10px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; color: var(--text-primary);">📊 Compare</button>
+        <button onclick="quickQuery('What anomalies are in this data?')" style="padding: 3px 10px; font-size: 10px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; color: var(--text-primary);">🔍 Anomalies</button>
+        <button onclick="quickQuery('Executive summary of this dashboard')" style="padding: 3px 10px; font-size: 10px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; color: var(--text-primary);">📖 Summary</button>
+        <button onclick="quickQuery('Top 5 by sales')" style="padding: 3px 10px; font-size: 10px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 14px; cursor: pointer; color: var(--text-primary);">📈 Top 5</button>
+        <label style="margin-left: auto; display: flex; align-items: center; gap: 3px; font-size: 10px; color: var(--text-secondary);">
+          <input type="checkbox" id="streamingMode" checked style="width: 12px; height: 12px;"> Stream
+        </label>
       </div>
 
       <!-- Input Area -->
@@ -115,7 +131,7 @@
             </svg>
           </button>
         </div>
-        <div class="input-hint">Press Enter to send • Powered by AI</div>
+        <div class="input-hint">Press Enter to send • Streaming enabled • Powered by AI</div>
       </div>
     </div>
 

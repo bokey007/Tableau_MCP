@@ -124,6 +124,14 @@ function setupEventListeners() {
 }
 
 /**
+ * Quick query helper for quick action buttons
+ */
+function quickQuery(query) {
+    document.getElementById('userInput').value = query;
+    sendMessage();
+}
+
+/**
  * Send user message to the AI agent
  */
 async function sendMessage() {
@@ -139,7 +147,137 @@ async function sendMessage() {
     // Add user message to chat
     addMessage(message, 'user');
     
-    // Show loading indicator
+    // Check streaming mode
+    const streamingCheckbox = document.getElementById('streamingMode');
+    const useStreaming = streamingCheckbox ? streamingCheckbox.checked : false;
+    
+    if (useStreaming) {
+        await sendMessageWithStreaming(message);
+    } else {
+        await sendMessageStandard(message);
+    }
+}
+
+/**
+ * Send message with SSE streaming
+ */
+async function sendMessageWithStreaming(message) {
+    const loadingId = addLoadingMessage('🤔 Analyzing...');
+    
+    try {
+        // Refresh dashboard context before sending
+        await captureDashboardContext();
+        
+        const requestBody = {
+            question: message,
+            username: 'tableau-extension-user',
+            thread_id: sessionThreadId,
+            dashboard_name: dashboardContext?.name || null,
+            worksheets: dashboardContext?.worksheets || [],
+            filters: dashboardContext?.filters || [],
+            datasources: dashboardContext?.datasources || [],
+            parameters: dashboardContext?.parameters || [],
+            selected_marks: dashboardContext?.selected_marks || []
+        };
+        
+        log('Sending streaming request', { question: message });
+        
+        const response = await fetch(`${CONFIG.API_URL}/dashboard/query/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+        });
+        
+        if (!response.ok) throw new Error(`API error: ${response.status}`);
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            
+            // Process complete SSE events
+            const lines = buffer.split('\n\n');
+            buffer = lines.pop(); // Keep incomplete event
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const eventData = JSON.parse(line.slice(6));
+                        handleStreamEvent(eventData, loadingId);
+                    } catch (e) {
+                        log('Parse error', e);
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        log('Streaming failed', err);
+        removeMessage(loadingId);
+        addMessage(`Connection error: ${err.message}`, 'assistant');
+    }
+}
+
+/**
+ * Handle SSE stream events
+ */
+function handleStreamEvent(event, loadingId) {
+    log('Stream event', event);
+    
+    if (event.event === 'thinking') {
+        updateLoadingMessage(loadingId, '🤔 ' + event.message);
+    } else if (event.event === 'querying') {
+        updateLoadingMessage(loadingId, '🔄 ' + event.message);
+    } else if (event.event === 'analyzing') {
+        updateLoadingMessage(loadingId, '📊 ' + event.message);
+    } else if (event.event === 'complete' || event.event === 'error') {
+        removeMessage(loadingId);
+        const data = event.data;
+        
+        // Store thread_id
+        if (data.thread_id && !sessionThreadId) {
+            sessionThreadId = data.thread_id;
+        }
+        updateStatus(`Connected • ${messageCount} messages`, 'connected');
+        
+        if (data.success !== false || data.analysis) {
+            const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || 'query'}</span>`;
+            const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
+                ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
+                : '';
+            const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
+            addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
+            
+            if (data.visualization && data.results?.data) {
+                renderVisualization(data.visualization, data.results.data);
+            }
+            if (data.results?.data?.length > 0) {
+                addDataPreview(data.results.data);
+            }
+        } else {
+            addMessage(`Error: ${data.error || 'Unknown error'}`, 'assistant');
+        }
+    }
+}
+
+/**
+ * Update loading message text
+ */
+function updateLoadingMessage(id, text) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.querySelector('.message-content').innerHTML = `<div style="display: flex; align-items: center; gap: 8px;">${text}</div>`;
+    }
+}
+
+/**
+ * Send message without streaming (standard mode)
+ */
+async function sendMessageStandard(message) {
     const loadingId = addLoadingMessage();
     
     try {
@@ -194,10 +332,13 @@ async function sendMessage() {
         
         // Handle response
         if (data.success !== false) {
-            // Show intent badge + parsed markdown analysis
+            // Show intent badge + query type badge + parsed markdown analysis
             const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || 'query'}</span>`;
+            const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
+                ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
+                : '';
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
-            addMessage(intentBadge + analysisHtml, 'assistant');
+            addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
             
             // Show visualization if available
             if (data.visualization && data.results?.data) {
@@ -370,19 +511,27 @@ function addMessage(content, role) {
 /**
  * Add loading indicator
  */
-function addLoadingMessage() {
+function addLoadingMessage(customText = null) {
     const container = document.getElementById('chatContainer');
     const messageDiv = document.createElement('div');
     const id = 'loading-' + Date.now();
     messageDiv.id = id;
     messageDiv.className = 'message assistant loading';
-    messageDiv.innerHTML = `
-        <div class="message-content">
-            <div class="loading-dot"></div>
-            <div class="loading-dot"></div>
-            <div class="loading-dot"></div>
-        </div>
-    `;
+    if (customText) {
+        messageDiv.innerHTML = `
+            <div class="message-content">
+                <div style="display: flex; align-items: center; gap: 8px;">${customText}</div>
+            </div>
+        `;
+    } else {
+        messageDiv.innerHTML = `
+            <div class="message-content">
+                <div class="loading-dot"></div>
+                <div class="loading-dot"></div>
+                <div class="loading-dot"></div>
+            </div>
+        `;
+    }
     container.appendChild(messageDiv);
     scrollToBottom();
     return id;
