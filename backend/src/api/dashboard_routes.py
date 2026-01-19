@@ -313,7 +313,7 @@ async def stream_query(request: DashboardQueryRequest):
             await asyncio.sleep(0.1)  # Small delay for UX
             
             # Get agent and process
-            agent = await get_dashboard_agent()
+            agent = get_dashboard_agent()  # sync function, not async
             
             # Send querying event
             yield f"data: {json.dumps({'event': 'querying', 'message': 'Processing query...'})}\n\n"
@@ -324,7 +324,7 @@ async def stream_query(request: DashboardQueryRequest):
             
             result = await agent.process(
                 question=request.question,
-                context=context,
+                dashboard_context=context,  # Match method signature
                 thread_id=request.thread_id
             )
             
@@ -336,10 +336,15 @@ async def stream_query(request: DashboardQueryRequest):
                 await asyncio.sleep(0.1)
             
             # Build final response
+            # Success if no error and we have analysis OR status is complete
+            is_success = (not result.get("error")) and (
+                result.get("status") == "complete" or 
+                result.get("analysis") is not None
+            )
             response = {
                 "event": "complete",
                 "data": {
-                    "success": result.get("status") == "complete" and not result.get("error"),
+                    "success": is_success,
                     "intent": result.get("intent"),
                     "query_type": result.get("query_type"),
                     "context_scope": result.get("context_scope"),
