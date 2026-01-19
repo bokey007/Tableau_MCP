@@ -252,10 +252,14 @@ function handleStreamEvent(event, loadingId) {
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
             addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
             
-            if (data.visualization && data.results?.data) {
+            // Only render visualization if BOTH exist and have actual data
+            const hasVisualization = data.visualization && typeof data.visualization === 'object' && Object.keys(data.visualization).length > 0 && data.visualization.chart_type;
+            const hasData = data.results && data.results !== null && typeof data.results === 'object' && Array.isArray(data.results.data) && data.results.data.length > 0;
+            
+            log('Visualization check', { hasVisualization, hasData });
+            
+            if (hasVisualization && hasData) {
                 renderVisualization(data.visualization, data.results.data);
-            }
-            if (data.results?.data?.length > 0) {
                 addDataPreview(data.results.data);
             }
         } else {
@@ -340,13 +344,14 @@ async function sendMessageStandard(message) {
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
             addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
             
-            // Show visualization if available
-            if (data.visualization && data.results?.data) {
-                renderVisualization(data.visualization, data.results.data);
-            }
+            // Only render visualization if BOTH exist and have actual data
+            const hasVisualization = data.visualization && typeof data.visualization === 'object' && Object.keys(data.visualization).length > 0 && data.visualization.chart_type;
+            const hasData = data.results && data.results !== null && typeof data.results === 'object' && Array.isArray(data.results.data) && data.results.data.length > 0;
             
-            // Show data preview if available
-            if (data.results?.data && data.results.data.length > 0) {
+            log('Visualization check (standard)', { hasVisualization, hasData });
+            
+            if (hasVisualization && hasData) {
+                renderVisualization(data.visualization, data.results.data);
                 addDataPreview(data.results.data);
             }
         } else {

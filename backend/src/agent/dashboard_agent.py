@@ -535,20 +535,34 @@ class DashboardAgent:
             return "data_query"
     
     async def _handle_chat(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Handle casual conversation."""
+        """Handle casual conversation with multi-turn memory."""
         question = state.get("question", "")
         
         try:
-            response = await self.llm.ainvoke([
-                SystemMessage(content=CHAT_RESPONSE_SYSTEM),
-                HumanMessage(content=question)
-            ])
+            # Build messages including conversation history
+            messages = [SystemMessage(content=CHAT_RESPONSE_SYSTEM)]
+            
+            # Add conversation history from state (maintained by LangGraph checkpointer)
+            history = state.get("messages", [])
+            if history:
+                # Include last 10 messages for context (5 turns)
+                messages.extend(history[-10:])
+            
+            # Add current user message
+            messages.append(HumanMessage(content=question))
+            
+            response = await self.llm.ainvoke(messages)
             
             state["analysis"] = response.content
             state["status"] = "complete"
-            state["messages"] = [AIMessage(content=response.content)]
+            # Add both user message and response to conversation history
+            state["messages"] = [
+                HumanMessage(content=question),
+                AIMessage(content=response.content)
+            ]
             
         except Exception as e:
+            logger.error("Chat handler error", error=str(e))
             state["analysis"] = "Hello! I'm here to help you analyze your dashboard data. What would you like to know?"
             state["status"] = "complete"
         
