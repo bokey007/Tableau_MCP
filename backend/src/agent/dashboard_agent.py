@@ -660,6 +660,13 @@ class DashboardAgent:
             
             logger.info("Context scope detected", scope=context_scope, filters_count=len(filters))
             
+            # Handle ambiguous scope - ask user
+            if context_scope == "ambiguous" and filters:
+                state["needs_clarification"] = True
+                state["analysis"] = self._create_scope_clarification(filters, "data")
+                state["status"] = "clarification_needed"
+                return state
+            
             # Build filter context for query enhancement
             filter_context = None
             if context_scope == "filtered" and filters:
@@ -728,6 +735,13 @@ This is a comparison query. Please:
             context_scope = await self._detect_context_scope(question, filters)
             state["context_scope"] = context_scope
             
+            # Handle ambiguous scope
+            if context_scope == "ambiguous" and filters:
+                state["needs_clarification"] = True
+                state["analysis"] = self._create_scope_clarification(filters, "comparison")
+                state["status"] = "clarification_needed"
+                return state
+            
             filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
             if filter_context:
                 enhanced_question += f"\n\n[Dashboard Filter Context: {filter_context}]"
@@ -783,6 +797,13 @@ This is an anomaly detection query. Please:
             # Detect scope and execute
             context_scope = await self._detect_context_scope(question, filters)
             state["context_scope"] = context_scope
+            
+            # Handle ambiguous scope
+            if context_scope == "ambiguous" and filters:
+                state["needs_clarification"] = True
+                state["analysis"] = self._create_scope_clarification(filters, "anomaly")
+                state["status"] = "clarification_needed"
+                return state
             
             filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
             if filter_context:
@@ -845,6 +866,13 @@ Please create a compelling data story:
             context_scope = await self._detect_context_scope(question, filters)
             state["context_scope"] = context_scope
             
+            # Handle ambiguous scope
+            if context_scope == "ambiguous" and filters:
+                state["needs_clarification"] = True
+                state["analysis"] = self._create_scope_clarification(filters, "storytelling")
+                state["status"] = "clarification_needed"
+                return state
+            
             result = await self.data_agent.execute_data_query(
                 question=enhanced_question,
                 datasource_id=None,
@@ -877,6 +905,7 @@ Please create a compelling data story:
         Returns:
             'filtered' - Apply dashboard filters to query
             'global' - Search all data ignoring filters
+            'ambiguous' - Unclear, should ask user
         """
         question_lower = question.lower()
         
@@ -891,7 +920,8 @@ Please create a compelling data story:
             "across all", "all regions", "all categories", "all time",
             "overall", "total across", "globally", "ignoring filter",
             "without filter", "entire dataset", "all data", "company-wide",
-            "organization-wide", "regardless of filter"
+            "organization-wide", "regardless of filter", "all customers",
+            "all products", "everywhere"
         ]
         for pattern in global_patterns:
             if pattern in question_lower:
@@ -900,15 +930,38 @@ Please create a compelling data story:
         # Explicit filtered keywords
         filtered_patterns = [
             "this region", "current filter", "as filtered", "what's shown",
-            "in this view", "with these filters", "selected", "currently applied"
+            "in this view", "with these filters", "selected", "currently applied",
+            "this selection", "filtered data", "current view", "here"
         ]
         for pattern in filtered_patterns:
             if pattern in question_lower:
                 return "filtered"
         
-        # Default: use filters if they exist (most common use case)
-        # User is viewing filtered dashboard, so they likely want filtered results
-        return "filtered"
+        # Ambiguous query with filters - need to ask the user
+        # Return 'ambiguous' to trigger clarification
+        return "ambiguous"
+    
+    def _create_scope_clarification(self, filters: List[Dict], query_type: str = "data") -> str:
+        """Create a clarification message when scope is ambiguous."""
+        filter_context = self._build_filter_context(filters)
+        
+        type_examples = {
+            "data": ('Top 5 customers', 'Top 5 customers'),
+            "comparison": ('Compare Q1 vs Q2', 'Compare Q1 vs Q2'),
+            "anomaly": ('Find anomalies', 'Find anomalies'),
+            "storytelling": ('Summarize the data', 'Summarize the data'),
+        }
+        example = type_examples.get(query_type, type_examples["data"])
+        
+        return (
+            f"📊 **I notice you have filters applied:** {filter_context}\n\n"
+            f"Would you like results for:\n"
+            f"- **Current view** (filtered by {filter_context})\n"
+            f"- **All data** (global, ignoring filters)\n\n"
+            f"💡 **Tip:** You can say:\n"
+            f'- "{example[0]} **in this view**" for filtered results\n'
+            f'- "{example[1]} **across all data**" for global results'
+        )
     
     def _build_filter_context(self, filters: List[Dict]) -> str:
         """Build a human-readable filter context string."""
