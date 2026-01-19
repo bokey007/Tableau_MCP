@@ -11,21 +11,36 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
       /* Markdown content styling */
-      .message-content h1, .message-content h2, .message-content h3 {
+      .message-content h1,
+      .message-content h2,
+      .message-content h3 {
         margin-top: 12px;
         margin-bottom: 8px;
         color: var(--text-primary);
       }
-      .message-content h3 { font-size: 14px; }
-      .message-content h2 { font-size: 15px; }
-      .message-content h1 { font-size: 16px; }
-      .message-content ul, .message-content ol {
+      .message-content h3 {
+        font-size: 14px;
+      }
+      .message-content h2 {
+        font-size: 15px;
+      }
+      .message-content h1 {
+        font-size: 16px;
+      }
+      .message-content ul,
+      .message-content ol {
         margin: 8px 0 8px 20px;
         padding: 0;
       }
-      .message-content li { margin: 4px 0; }
-      .message-content p { margin: 8px 0; }
-      .message-content strong { color: var(--primary-color); }
+      .message-content li {
+        margin: 4px 0;
+      }
+      .message-content p {
+        margin: 8px 0;
+      }
+      .message-content strong {
+        color: var(--primary-color);
+      }
       .message-content code {
         background: var(--surface-light);
         padding: 2px 6px;
@@ -49,7 +64,8 @@
         margin: 12px 0;
         font-size: 12px;
       }
-      .message-content th, .message-content td {
+      .message-content th,
+      .message-content td {
         padding: 8px;
         border: 1px solid var(--border-color);
         text-align: left;
@@ -105,8 +121,12 @@
             Try these query types:
             <ul style="margin: 8px 0 0 16px; padding: 0">
               <li>📊 <strong>Comparison:</strong> "Compare Q1 vs Q2 sales"</li>
-              <li>🔍 <strong>Anomaly:</strong> "What's unusual in this data?"</li>
-              <li>📖 <strong>Storytelling:</strong> "Summarize this dashboard"</li>
+              <li>
+                🔍 <strong>Anomaly:</strong> "What's unusual in this data?"
+              </li>
+              <li>
+                📖 <strong>Storytelling:</strong> "Summarize this dashboard"
+              </li>
               <li>📈 <strong>Data:</strong> "Top 5 products by sales"</li>
             </ul>
           </div>
@@ -114,13 +134,91 @@
       </div>
 
       <!-- Quick Actions -->
-      <div id="quickActions" style="padding: 8px 16px; display: flex; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--border-color);">
-        <button onclick="quickQuery('Compare Q1 vs Q2 sales')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📊 Compare</button>
-        <button onclick="quickQuery('What anomalies or unusual patterns are in this data?')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">🔍 Anomalies</button>
-        <button onclick="quickQuery('Give me an executive summary of this dashboard')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📖 Summary</button>
-        <button onclick="quickQuery('Top 5 products by sales')" style="padding: 4px 12px; font-size: 11px; background: var(--surface-light); border: 1px solid var(--border-color); border-radius: 16px; cursor: pointer; color: var(--text-primary);">📈 Top 5</button>
-        <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-secondary);">
-          <input type="checkbox" id="streamingMode" checked style="width: 14px; height: 14px;"> Stream
+      <div
+        id="quickActions"
+        style="
+          padding: 8px 16px;
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+          border-bottom: 1px solid var(--border-color);
+        "
+      >
+        <button
+          onclick="quickQuery('Compare Q1 vs Q2 sales')"
+          style="
+            padding: 4px 12px;
+            font-size: 11px;
+            background: var(--surface-light);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            cursor: pointer;
+            color: var(--text-primary);
+          "
+        >
+          📊 Compare
+        </button>
+        <button
+          onclick="
+            quickQuery('What anomalies or unusual patterns are in this data?')
+          "
+          style="
+            padding: 4px 12px;
+            font-size: 11px;
+            background: var(--surface-light);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            cursor: pointer;
+            color: var(--text-primary);
+          "
+        >
+          🔍 Anomalies
+        </button>
+        <button
+          onclick="quickQuery('Give me an executive summary of this dashboard')"
+          style="
+            padding: 4px 12px;
+            font-size: 11px;
+            background: var(--surface-light);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            cursor: pointer;
+            color: var(--text-primary);
+          "
+        >
+          📖 Summary
+        </button>
+        <button
+          onclick="quickQuery('Top 5 products by sales')"
+          style="
+            padding: 4px 12px;
+            font-size: 11px;
+            background: var(--surface-light);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            cursor: pointer;
+            color: var(--text-primary);
+          "
+        >
+          📈 Top 5
+        </button>
+        <label
+          style="
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+          "
+        >
+          <input
+            type="checkbox"
+            id="streamingMode"
+            checked
+            style="width: 14px; height: 14px"
+          />
+          Stream
         </label>
       </div>
 
@@ -163,7 +261,7 @@
       };
 
       // Session state - maintains conversation memory
-      let sessionThreadId = null;  // Will be set after first response
+      let sessionThreadId = null; // Will be set after first response
       let messageCount = 0;
 
       // Simulated dashboard context (in real Extension, this comes from Tableau API)
@@ -214,7 +312,7 @@
         messageCount++;
 
         const useStreaming = document.getElementById("streamingMode").checked;
-        
+
         if (useStreaming) {
           await sendMessageWithStreaming(message);
         } else {
@@ -239,11 +337,14 @@
 
           log("Sending streaming request", { question: message });
 
-          const response = await fetch(`${CONFIG.API_URL}/dashboard/query/stream`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(requestBody),
-          });
+          const response = await fetch(
+            `${CONFIG.API_URL}/dashboard/query/stream`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(requestBody),
+            },
+          );
 
           if (!response.ok) throw new Error(`API error: ${response.status}`);
 
@@ -256,11 +357,11 @@
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
-            
+
             // Process complete SSE events
             const lines = buffer.split("\n\n");
             buffer = lines.pop(); // Keep incomplete event
-            
+
             for (const line of lines) {
               if (line.startsWith("data: ")) {
                 try {
@@ -281,7 +382,7 @@
 
       function handleStreamEvent(event, loadingId) {
         log("Stream event", event);
-        
+
         if (event.event === "thinking") {
           updateLoadingMessage(loadingId, "🤔 " + event.message);
         } else if (event.event === "querying") {
@@ -291,26 +392,48 @@
         } else if (event.event === "complete" || event.event === "error") {
           removeMessage(loadingId);
           const data = event.data;
-          
+
           // Store thread_id
           if (data.thread_id && !sessionThreadId) {
             sessionThreadId = data.thread_id;
           }
           updateStatus();
-          
+
           if (data.success !== false) {
             const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || "unknown"}</span>`;
-            const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
-              ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
-              : '';
-            const analysisHtml = parseMarkdown(data.analysis || "Response received.");
-            addMessage(intentBadge + queryTypeBadge + analysisHtml, "assistant");
-            
-            if (data.visualization && data.results?.data) {
+            const queryTypeBadge =
+              data.query_type && data.query_type !== "standard"
+                ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>`
+                : "";
+            const analysisHtml = parseMarkdown(
+              data.analysis || "Response received.",
+            );
+            addMessage(
+              intentBadge + queryTypeBadge + analysisHtml,
+              "assistant",
+            );
+
+            // Only render visualization if BOTH exist and have actual data
+            const hasVisualization =
+              data.visualization &&
+              typeof data.visualization === "object" &&
+              Object.keys(data.visualization).length > 0 &&
+              data.visualization.chart_type;
+            const hasData =
+              data.results &&
+              data.results !== null &&
+              typeof data.results === "object" &&
+              Array.isArray(data.results.data) &&
+              data.results.data.length > 0;
+
+            log("Visualization check", { hasVisualization, hasData, viz: data.visualization, results: data.results });
+
+            if (hasVisualization && hasData) {
+              log("Rendering chart and data preview");
               renderVisualization(data.visualization, data.results.data);
-            }
-            if (data.results?.data?.length > 0) {
               addDataPreview(data.results.data);
+            } else {
+              log("Skipping chart/data - no valid visualization data");
             }
           } else {
             addMessage(`Error: ${data.error || "Unknown error"}`, "assistant");
@@ -321,12 +444,13 @@
       function updateLoadingMessage(id, text) {
         const el = document.getElementById(id);
         if (el) {
-          el.querySelector('.message-content').innerHTML = `<div style="display: flex; align-items: center; gap: 8px;">${text}</div>`;
+          el.querySelector(".message-content").innerHTML =
+            `<div style="display: flex; align-items: center; gap: 8px;">${text}</div>`;
         }
       }
 
       function updateStatus() {
-        document.getElementById("connectionStatus").textContent = 
+        document.getElementById("connectionStatus").textContent =
           `Connected • Session active (${messageCount} messages)`;
       }
 
@@ -345,7 +469,10 @@
             datasources: DEMO_CONTEXT.datasources,
           };
 
-          log("Sending request", { ...requestBody, thread_id: sessionThreadId || "(new session)" });
+          log("Sending request", {
+            ...requestBody,
+            thread_id: sessionThreadId || "(new session)",
+          });
 
           const response = await fetch(`${CONFIG.API_URL}/dashboard/query`, {
             method: "POST",
@@ -361,13 +488,15 @@
           // Store thread_id for conversation continuity
           if (data.thread_id && !sessionThreadId) {
             sessionThreadId = data.thread_id;
-            log("Session started", { thread_id: sessionThreadId.substring(0, 8) + "..." });
+            log("Session started", {
+              thread_id: sessionThreadId.substring(0, 8) + "...",
+            });
             // Update status to show conversation is active
-            document.getElementById("connectionStatus").textContent = 
+            document.getElementById("connectionStatus").textContent =
               `Connected • Session active (${messageCount} messages)`;
           } else if (sessionThreadId) {
             // Update message count
-            document.getElementById("connectionStatus").textContent = 
+            document.getElementById("connectionStatus").textContent =
               `Connected • Session active (${messageCount} messages)`;
           }
 
@@ -376,19 +505,25 @@
           if (data.success !== false) {
             // Show intent badge
             const intentBadge = `<span style="background: var(--primary-color); padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.intent || "unknown"}</span>`;
-            
+
             // Parse markdown for better formatting
-            const analysisHtml = parseMarkdown(data.analysis || "Response received.");
+            const analysisHtml = parseMarkdown(
+              data.analysis || "Response received.",
+            );
             addMessage(intentBadge + analysisHtml, "assistant");
 
-            // Show visualization if available
-            if (data.visualization) {
-              renderVisualization(data.visualization, data.results?.data);
-            }
+            // Only render visualization if BOTH exist and have actual data
+            const hasVisualization = data.visualization && typeof data.visualization === 'object' && Object.keys(data.visualization).length > 0 && data.visualization.chart_type;
+            const hasData = data.results && data.results !== null && typeof data.results === 'object' && Array.isArray(data.results.data) && data.results.data.length > 0;
 
-            // Show data preview if available
-            if (data.results?.data && data.results.data.length > 0) {
+            log("Visualization check (standard)", { hasVisualization, hasData, viz: data.visualization, results: data.results });
+
+            if (hasVisualization && hasData) {
+              log("Rendering chart and data preview");
+              renderVisualization(data.visualization, data.results.data);
               addDataPreview(data.results.data);
+            } else {
+              log("Skipping chart/data - no valid visualization data");
             }
           } else {
             addMessage(`Error: ${data.error || "Unknown error"}`, "assistant");
@@ -408,7 +543,7 @@
         if (!text) return "";
         try {
           // Use marked.js if available
-          if (typeof marked !== 'undefined') {
+          if (typeof marked !== "undefined") {
             return marked.parse(text);
           }
         } catch (e) {
@@ -416,63 +551,78 @@
         }
         // Fallback: basic formatting
         return text
-          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-          .replace(/\n/g, '<br>');
+          .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+          .replace(/\n/g, "<br>");
       }
 
       // Render visualization (chart) from backend config + data
       function renderVisualization(vizConfig, data) {
         // Backend returns: { chart_type, x_axis, y_axis, reason }
         // We need to transform this + data into Chart.js format
-        
+
         if (!vizConfig || !data || !data.length) {
-          log("Cannot render visualization - missing config or data", { vizConfig, dataLength: data?.length });
+          log("Cannot render visualization - missing config or data", {
+            vizConfig,
+            dataLength: data?.length,
+          });
           return;
         }
-        
+
         log("Rendering visualization", { vizConfig, dataRows: data.length });
-        
+
         // Get chart type (backend uses chart_type, frontend expects type)
-        const chartType = vizConfig.chart_type || vizConfig.type || 'bar';
-        
+        const chartType = vizConfig.chart_type || vizConfig.type || "bar";
+
         // Extract labels and values from data using vizConfig's axis definitions
         const xAxis = vizConfig.x_axis || Object.keys(data[0])[0];
         const yAxis = vizConfig.y_axis || Object.keys(data[0])[1];
-        
+
         // Clean axis names (remove aggregation wrappers like SUM(), AVG())
-        const xAxisClean = xAxis.replace(/^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i, '$2');
-        const yAxisClean = yAxis.replace(/^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i, '$2');
-        
+        const xAxisClean = xAxis.replace(
+          /^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i,
+          "$2",
+        );
+        const yAxisClean = yAxis.replace(
+          /^(SUM|AVG|COUNT|MAX|MIN)\((.+)\)$/i,
+          "$2",
+        );
+
         // Find matching columns in data (case-insensitive, partial match)
         const findColumn = (axis) => {
-          const axisLower = axis.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const axisLower = axis.toLowerCase().replace(/[^a-z0-9]/g, "");
           const keys = Object.keys(data[0]);
-          return keys.find(k => {
-            const keyLower = k.toLowerCase().replace(/[^a-z0-9]/g, '');
-            return keyLower.includes(axisLower) || axisLower.includes(keyLower);
-          }) || keys[0];
+          return (
+            keys.find((k) => {
+              const keyLower = k.toLowerCase().replace(/[^a-z0-9]/g, "");
+              return (
+                keyLower.includes(axisLower) || axisLower.includes(keyLower)
+              );
+            }) || keys[0]
+          );
         };
-        
+
         const labelKey = findColumn(xAxisClean);
         const valueKey = findColumn(yAxisClean);
-        
+
         log("Chart axes mapped", { xAxis, yAxis, labelKey, valueKey });
-        
+
         // Extract labels and values (limit to 10 for readability)
         const chartData = data.slice(0, 10);
-        const labels = chartData.map(row => {
+        const labels = chartData.map((row) => {
           const val = row[labelKey];
           // Truncate long labels
-          return typeof val === 'string' && val.length > 25 ? val.substring(0, 22) + '...' : val;
+          return typeof val === "string" && val.length > 25
+            ? val.substring(0, 22) + "..."
+            : val;
         });
-        const values = chartData.map(row => {
+        const values = chartData.map((row) => {
           const val = row[valueKey];
-          return typeof val === 'number' ? val : parseFloat(val) || 0;
+          return typeof val === "number" ? val : parseFloat(val) || 0;
         });
-        
+
         const container = document.getElementById("chatContainer");
         const chartId = "chart-" + Date.now();
-        
+
         // Create chart container
         const chartDiv = document.createElement("div");
         chartDiv.className = "message assistant";
@@ -488,49 +638,68 @@
         `;
         container.appendChild(chartDiv);
         container.scrollTop = container.scrollHeight;
-        
+
         // Wait for DOM and render chart
         setTimeout(() => {
           const ctx = document.getElementById(chartId);
-          if (!ctx || typeof Chart === 'undefined') {
+          if (!ctx || typeof Chart === "undefined") {
             log("Chart.js not available");
             return;
           }
-          
+
           try {
             new Chart(ctx, {
-              type: chartType === 'bar' ? 'bar' : chartType,
+              type: chartType === "bar" ? "bar" : chartType,
               data: {
                 labels: labels,
-                datasets: [{
-                  label: yAxisClean,
-                  data: values,
-                  backgroundColor: [
-                    '#4a90d9', '#48bb78', '#fc8181', '#f6ad55', '#9f7aea',
-                    '#4fd1c5', '#f687b3', '#68d391', '#63b3ed', '#fbd38d'
-                  ],
-                  borderColor: 'rgba(255,255,255,0.2)',
-                  borderWidth: 1
-                }]
+                datasets: [
+                  {
+                    label: yAxisClean,
+                    data: values,
+                    backgroundColor: [
+                      "#4a90d9",
+                      "#48bb78",
+                      "#fc8181",
+                      "#f6ad55",
+                      "#9f7aea",
+                      "#4fd1c5",
+                      "#f687b3",
+                      "#68d391",
+                      "#63b3ed",
+                      "#fbd38d",
+                    ],
+                    borderColor: "rgba(255,255,255,0.2)",
+                    borderWidth: 1,
+                  },
+                ],
               },
               options: {
                 responsive: true,
                 maintainAspectRatio: true,
-                indexAxis: chartType === 'horizontalBar' ? 'y' : 'x',
+                indexAxis: chartType === "horizontalBar" ? "y" : "x",
                 plugins: {
                   legend: { display: false },
                   title: {
                     display: true,
                     text: `${yAxisClean} by ${xAxisClean}`,
-                    color: '#ffffff',
-                    font: { size: 13 }
-                  }
+                    color: "#ffffff",
+                    font: { size: 13 },
+                  },
                 },
-                scales: chartType === 'pie' || chartType === 'doughnut' ? {} : {
-                  x: { ticks: { color: '#a0aec0', maxRotation: 45 }, grid: { color: '#2d3748' } },
-                  y: { ticks: { color: '#a0aec0' }, grid: { color: '#2d3748' } }
-                }
-              }
+                scales:
+                  chartType === "pie" || chartType === "doughnut"
+                    ? {}
+                    : {
+                        x: {
+                          ticks: { color: "#a0aec0", maxRotation: 45 },
+                          grid: { color: "#2d3748" },
+                        },
+                        y: {
+                          ticks: { color: "#a0aec0" },
+                          grid: { color: "#2d3748" },
+                        },
+                      },
+              },
             });
             log("Chart rendered successfully");
           } catch (e) {

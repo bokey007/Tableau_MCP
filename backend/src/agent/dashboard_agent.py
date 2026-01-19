@@ -901,11 +901,12 @@ Please create a compelling data story:
     async def _detect_context_scope(self, question: str, filters: List[Dict]) -> str:
         """
         Detect whether user wants filtered (dashboard context) or global (all data) results.
+        Uses LLM for intelligent classification when keywords don't clearly indicate intent.
         
         Returns:
             'filtered' - Apply dashboard filters to query
             'global' - Search all data ignoring filters
-            'ambiguous' - Unclear, should ask user
+            'ambiguous' - Unclear even to LLM, should ask user
         """
         question_lower = question.lower()
         
@@ -913,15 +914,14 @@ Please create a compelling data story:
         if not filters:
             return "global"
         
-        # Heuristic detection first (fast path)
+        # Fast path: Explicit keywords (avoid LLM call for obvious cases)
         
         # Explicit global keywords
         global_patterns = [
             "across all", "all regions", "all categories", "all time",
             "overall", "total across", "globally", "ignoring filter",
             "without filter", "entire dataset", "all data", "company-wide",
-            "organization-wide", "regardless of filter", "all customers",
-            "all products", "everywhere"
+            "organization-wide", "regardless of filter", "everywhere"
         ]
         for pattern in global_patterns:
             if pattern in question_lower:
@@ -931,15 +931,51 @@ Please create a compelling data story:
         filtered_patterns = [
             "this region", "current filter", "as filtered", "what's shown",
             "in this view", "with these filters", "selected", "currently applied",
-            "this selection", "filtered data", "current view", "here"
+            "filtered data", "current view", "here", "current scope", "within scope"
         ]
         for pattern in filtered_patterns:
             if pattern in question_lower:
                 return "filtered"
         
-        # Ambiguous query with filters - need to ask the user
-        # Return 'ambiguous' to trigger clarification
-        return "ambiguous"
+        # LLM-based classification for ambiguous queries
+        try:
+            filter_context = self._build_filter_context(filters)
+            
+            scope_prompt = f"""You are analyzing a user's query to determine their data scope intent.
+
+Current dashboard filters: {filter_context}
+
+User question: "{question}"
+
+Based on the question, determine if the user wants:
+- FILTERED: Results limited to the current dashboard filters ({filter_context})
+- GLOBAL: Results from all data, ignoring the dashboard filters
+- AMBIGUOUS: Cannot determine intent, need to ask user
+
+Consider:
+- Questions about "top", "best", "highest" without context specifiers are typically AMBIGUOUS
+- Questions referencing "current", "this view", "selected", "here" suggest FILTERED
+- Questions with "all", "overall", "entire", "company-wide" suggest GLOBAL
+- Questions that are conversational or off-topic (greetings, personal) should return GLOBAL
+
+Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
+
+            response = await self.llm.ainvoke([{"role": "user", "content": scope_prompt}])
+            result = response.content.strip().upper()
+            
+            if "FILTERED" in result:
+                logger.info("LLM scope detection: filtered", question=question[:30])
+                return "filtered"
+            elif "GLOBAL" in result:
+                logger.info("LLM scope detection: global", question=question[:30])
+                return "global"
+            else:
+                logger.info("LLM scope detection: ambiguous", question=question[:30])
+                return "ambiguous"
+                
+        except Exception as e:
+            logger.warning("LLM scope detection failed, defaulting to ambiguous", error=str(e))
+            return "ambiguous"
     
     def _create_scope_clarification(self, filters: List[Dict], query_type: str = "data") -> str:
         """Create a clarification message when scope is ambiguous."""
