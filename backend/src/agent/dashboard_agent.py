@@ -33,6 +33,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.core.config import settings
 from src.core.logging import get_logger
 from src.agent.graph import TableauAgent  # Import existing Data Agent
+from src.services.config_service import get_config_service, DashboardConfig
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,7 @@ class DashboardAgentState(TypedDict, total=False):
     question: str
     username: str
     dashboard_context: DashboardContext
+    dashboard_config: Optional[Dict[str, Any]]  # Config enrichment from YAML
     
     # Processing
     intent: str  # chat, capability, dashboard_context, clarification, data_query, comparison, anomaly, storytelling
@@ -384,6 +386,7 @@ class DashboardAgent:
         """Classify user intent using heuristics + LLM fallback."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
+        config = state.get("dashboard_config")
         question_lower = question.lower().strip()
         
         logger.info("Classifying intent", question=question[:50])
@@ -396,7 +399,7 @@ class DashboardAgent:
         
         if intent is None:
             # LLM fallback for ambiguous cases
-            intent = await self._classify_by_llm(question, context)
+            intent = await self._classify_by_llm(question, context, config)
         
         state["intent"] = intent
         logger.info("Intent classified", intent=intent)
@@ -506,10 +509,10 @@ class DashboardAgent:
         
         return None  # Needs LLM classification
     
-    async def _classify_by_llm(self, question: str, context: DashboardContext) -> str:
+    async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
         """Use LLM for ambiguous intent classification."""
         try:
-            context_str = self._format_context_summary(context)
+            context_str = self._format_context_summary(context, config)
             prompt = INTENT_CLASSIFIER_PROMPT.format(
                 question=question,
                 context=context_str
@@ -925,8 +928,57 @@ Please create a compelling data story:
     # Helper Methods
     # =========================================================================
     
-    def _format_context_summary(self, context: DashboardContext) -> str:
-        """Format context for LLM prompts."""
+    def _build_config_context(self, config: Optional[Dict]) -> str:
+        """Build prompt context from dashboard config."""
+        if not config:
+            return ""
+        
+        parts = []
+        
+        # KPIs
+        kpis = config.get("kpis", [])
+        if kpis:
+            kpi_lines = []
+            for kpi in kpis:
+                name = kpi.get("name", "")
+                field = kpi.get("field", "")
+                desc = kpi.get("description", "")
+                target = kpi.get("target")
+                if name:
+                    line = f"- {name}"
+                    if field:
+                        line += f" (field: {field})"
+                    if desc:
+                        line += f": {desc}"
+                    if target:
+                        line += f" [target: {target}]"
+                    kpi_lines.append(line)
+            if kpi_lines:
+                parts.append("KEY METRICS:\n" + "\n".join(kpi_lines))
+        
+        # Glossary
+        glossary = config.get("glossary", {})
+        if glossary:
+            glossary_lines = []
+            for term, definition in glossary.items():
+                if isinstance(definition, dict):
+                    field = definition.get("field", "")
+                    desc = definition.get("description", "")
+                    glossary_lines.append(f"- {term} → {field}" + (f" ({desc})" if desc else ""))
+                else:
+                    glossary_lines.append(f"- {term} → {definition}")
+            if glossary_lines:
+                parts.append("BUSINESS TERMS:\n" + "\n".join(glossary_lines))
+        
+        # AI Instructions
+        ai_instructions = config.get("ai_instructions")
+        if ai_instructions:
+            parts.append(f"SPECIAL INSTRUCTIONS:\n{ai_instructions.strip()}")
+        
+        return "\n\n".join(parts)
+    
+    def _format_context_summary(self, context: DashboardContext, config: Optional[Dict] = None) -> str:
+        """Format context for LLM prompts, including config enrichment."""
         if not context:
             return "No dashboard context"
         
@@ -937,7 +989,15 @@ Please create a compelling data story:
             filters = [f"{f.get('field')}={f.get('value', 'All')}" for f in context["filters"]]
             parts.append(f"Filters: {', '.join(filters)}")
         
-        return "; ".join(parts) if parts else "Minimal context"
+        base_context = "; ".join(parts) if parts else "Minimal context"
+        
+        # Add config enrichment
+        if config:
+            config_context = self._build_config_context(config)
+            if config_context:
+                return f"{base_context}\n\n--- Dashboard Configuration ---\n{config_context}"
+        
+        return base_context
     
     def _enrich_with_context(self, analysis: str, context: DashboardContext) -> str:
         """Add filter context to analysis."""
@@ -976,11 +1036,31 @@ Please create a compelling data story:
         """
         start_time = datetime.now()
         
+        # Lookup dashboard config (if exists)
+        dashboard_name = (dashboard_context or {}).get("dashboard_name", "")
+        config_service = get_config_service()
+        dashboard_cfg = config_service.get_config(dashboard_name)
+        
+        # Convert config to dict for state (if found)
+        config_dict = None
+        if dashboard_cfg:
+            config_dict = {
+                "name": dashboard_cfg.name,
+                "kpis": [{"name": k.name, "field": k.field, "description": k.description, 
+                         "target": k.target, "format": k.format} for k in dashboard_cfg.kpis],
+                "glossary": dashboard_cfg.glossary,
+                "ai_instructions": dashboard_cfg.ai_instructions,
+                "suggested_questions": dashboard_cfg.suggested_questions,
+                "anomaly_thresholds": dashboard_cfg.anomaly_thresholds,
+            }
+            logger.info("Dashboard config found", dashboard=dashboard_name, config_file=dashboard_cfg._source_file)
+        
         # Build initial state
         initial_state: DashboardAgentState = {
             "question": question.strip(),
             "username": username,
             "dashboard_context": dashboard_context or {},
+            "dashboard_config": config_dict,
             "status": "started",
             "needs_clarification": False,
         }

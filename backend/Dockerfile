@@ -46,6 +46,9 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source code
 COPY src/ /app/src/
 
+# Copy dashboard configurations
+COPY configs/ /app/configs/
+
 # Create necessary directories with correct permissions
 RUN mkdir -p /app/logs /app/tmp && \
     chown -R appuser:appgroup /app

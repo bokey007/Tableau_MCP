@@ -1,0 +1,158 @@
+# Dashboard Configuration Template
+# ================================
+# Copy this file and rename to match your Tableau dashboard name.
+# Example: "Sales Performance.yaml" or "marketing_dashboard.yaml"
+#
+# All sections are OPTIONAL - add only what you need.
+# The system will auto-infer from Tableau and MERGE your enrichments.
+
+version: "1.0"
+
+# ============================================================
+# DASHBOARD IDENTIFICATION
+# ============================================================
+dashboard:
+  name: "Sales Performance" # Must match Tableau dashboard name
+  aliases: # Alternative names to match
+    - "Sales Dashboard"
+    - "Regional Sales"
+  description: "Regional sales tracking for leadership"
+  owner: "sales-team@company.com"
+  category: "sales" # For grouping configs
+
+# ============================================================
+# KEY PERFORMANCE INDICATORS
+# ============================================================
+# Define your key metrics so the AI understands their meaning
+kpis:
+  - name: "Total Revenue"
+    field: "Sales Amount" # Tableau field name
+    aggregation: "sum" # sum, avg, count, count_distinct
+    format: "currency" # currency, percent, number
+    description: "Sum of all sales transactions"
+    target: 1000000 # For anomaly/comparison
+    good_direction: "up" # up, down, neutral
+
+  - name: "Average Order Value"
+    formula: "SUM([Sales Amount]) / COUNT([Order ID])"
+    format: "currency"
+    description: "Average value per order"
+
+  - name: "Customer Retention"
+    field: "Retention Rate"
+    format: "percent"
+    target: 85
+    good_direction: "up"
+
+# ============================================================
+# BUSINESS GLOSSARY (Term → Field/Definition)
+# ============================================================
+# Map business terms your users say to actual Tableau fields
+glossary:
+  # Simple mappings (term: field)
+  "revenue": "Sales Amount"
+  "sales": "Sales Amount"
+  "profit margin": "Profit Ratio"
+
+  # Abbreviations
+  "ARR": "Annual Recurring Revenue"
+  "MRR": "Monthly Recurring Revenue"
+  "YoY": "Year over Year comparison"
+  "MoM": "Month over Month comparison"
+  "QoQ": "Quarter over Quarter comparison"
+
+  # Rich definitions (term with description)
+  "churn":
+    field: "Customer Churn Rate"
+    description: "Percentage of customers who stopped buying"
+    context: "Lower is better. Industry avg is 5%"
+
+# ============================================================
+# FIELD ANNOTATIONS (Optional - enhances schema)
+# ============================================================
+# Add metadata to specific fields
+fields:
+  "Sales Amount":
+    display_name: "Revenue"
+    priority: "high" # high, medium, low
+
+  "Customer ID":
+    display_name: "Customer"
+    is_identifier: true # Don't aggregate
+
+  "Order Date":
+    date_granularities: # For time-based queries
+      - "Year"
+      - "Quarter"
+      - "Month"
+      - "Week"
+
+# ============================================================
+# HIERARCHIES (Optional - for drill-down)
+# ============================================================
+# Define drill-down paths
+hierarchies:
+  geography:
+    - "Country"
+    - "Region"
+    - "State"
+    - "City"
+  product:
+    - "Category"
+    - "Sub-Category"
+    - "Product Name"
+
+# ============================================================
+# SUGGESTED QUESTIONS (Quick Actions)
+# ============================================================
+# Custom questions shown in the extension
+suggested_questions:
+  # Simple strings
+  - "What is our total revenue this quarter?"
+  - "Compare sales by region"
+  - "Who are our top 10 customers?"
+
+  # With intent hints (optional)
+  - question: "Any anomalies in recent data?"
+    intent: "anomaly"
+  - question: "Executive summary"
+    intent: "storytelling"
+
+# ============================================================
+# AI BEHAVIOR INSTRUCTIONS
+# ============================================================
+# Fine-tune how the AI responds for this dashboard
+ai_instructions: |
+  This dashboard is used by Sales Leadership.
+
+  Formatting:
+  - Always format monetary values in USD with commas
+  - Show percentages with 1 decimal place
+
+  Comparisons:
+  - Always include absolute difference AND % change
+  - Use ↑ or ↓ arrows for trends
+
+  Context:
+  - Q1 = Jan-Mar, Q2 = Apr-Jun, Q3 = Jul-Sep, Q4 = Oct-Dec
+  - Fiscal year starts in January
+
+  Highlights:
+  - Flag values exceeding targets in green
+  - Flag values below targets in red
+  - Note any values > 2 std deviations
+
+# ============================================================
+# ANOMALY THRESHOLDS (Optional)
+# ============================================================
+# Customize what counts as an anomaly
+anomaly_thresholds:
+  default_deviation: 2.0 # Standard deviations
+
+  # Field-specific thresholds
+  "Sales Amount":
+    drop_alert: -15% # Alert if drops > 15%
+    spike_alert: 50% # Alert if spikes > 50%
+
+  "Customer Count":
+    drop_alert: -10%

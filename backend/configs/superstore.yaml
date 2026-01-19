@@ -1,0 +1,74 @@
+# Superstore Dashboard Configuration
+# Used for testing the config enrichment feature
+
+version: "1.0"
+
+dashboard:
+  name: "Superstore"
+  aliases:
+    - "Sample - Superstore"
+    - "Superstore Dashboard"
+  description: "Retail analytics for the Sample Superstore dataset"
+  category: "retail"
+
+kpis:
+  - name: "Total Sales"
+    field: "Sales"
+    aggregation: "sum"
+    format: "currency"
+    description: "Total sales amount in USD"
+
+  - name: "Total Profit"
+    field: "Profit"
+    aggregation: "sum"
+    format: "currency"
+    description: "Total profit margin"
+    target: 100000
+    good_direction: "up"
+
+  - name: "Order Count"
+    field: "Order ID"
+    aggregation: "count_distinct"
+    description: "Number of unique orders"
+
+glossary:
+  "revenue": "Sales"
+  "margin": "Profit"
+  "AOV": "Average Order Value (Sales / Order Count)"
+  "YoY": "Year over Year comparison"
+  "top customers": "Customers with highest Sales"
+  "underperforming": "Negative Profit"
+
+suggested_questions:
+  - question: "What are our total sales this quarter?"
+    intent: "data_query"
+  - question: "Compare sales by region"
+    intent: "comparison"
+  - question: "Which products are underperforming?"
+    intent: "anomaly"
+  - question: "Executive summary of the dashboard"
+    intent: "storytelling"
+  - question: "Who are our top 5 customers?"
+    intent: "data_query"
+
+ai_instructions: |
+  This is a retail analytics dashboard for Superstore.
+
+  Key context:
+  - Sales and Profit are in USD
+  - There are 4 regions: West, East, Central, South
+  - Product categories: Furniture, Office Supplies, Technology
+  - Ship modes: Same Day, First Class, Second Class, Standard Class
+
+  When analyzing:
+  - Always mention the time period if relevant
+  - Highlight profit margins (Profit/Sales ratio)
+  - Flag any negative profit as concerning
+  - Compare to previous periods when possible
+
+anomaly_thresholds:
+  "Profit":
+    drop_alert: -20%
+  "Sales":
+    drop_alert: -15%
+    spike_alert: 50%

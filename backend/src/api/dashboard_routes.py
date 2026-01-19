@@ -14,6 +14,7 @@ import asyncio
 import json
 
 from src.agent.dashboard_agent import get_dashboard_agent, DashboardContext
+from src.services.config_service import get_config_service
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -202,8 +203,59 @@ async def get_capabilities():
             "Data storytelling (executive summaries)",
             "Conversation memory (multi-turn)",
             "Query history and favorites",
-            "Data visualization recommendations"
+            "Data visualization recommendations",
+            "Dashboard-specific configuration"
         ]
+    }
+
+
+# =============================================================================
+# Dashboard Configuration (Read-Only)
+# =============================================================================
+
+@router.get("/config/{dashboard_name}")
+def get_dashboard_config(dashboard_name: str):
+    """
+    Get dashboard-specific configuration (if exists).
+    
+    This is read-only - configs are managed via YAML files in backend/configs/.
+    Returns suggested questions, KPIs, and other enrichments for the dashboard.
+    """
+    config_service = get_config_service()
+    config = config_service.get_config(dashboard_name)
+    
+    if not config:
+        return {
+            "found": False,
+            "dashboard_name": dashboard_name,
+            "suggested_questions": [
+                {"question": "What is the total sales?"},
+                {"question": "Compare regions"},
+                {"question": "Any anomalies?"},
+                {"question": "Executive summary"}
+            ]
+        }
+    
+    return {
+        "found": True,
+        "dashboard_name": config.name,
+        "description": config.description,
+        "kpis": [
+            {"name": kpi.name, "field": kpi.field, "description": kpi.description}
+            for kpi in config.kpis
+        ],
+        "suggested_questions": config.suggested_questions,
+        "has_ai_instructions": bool(config.ai_instructions)
+    }
+
+
+@router.get("/configs")
+def list_dashboard_configs():
+    """List all available dashboard configurations."""
+    config_service = get_config_service()
+    return {
+        "configs": config_service.list_configs(),
+        "config_directory": str(config_service.config_dir)
     }
 
 
