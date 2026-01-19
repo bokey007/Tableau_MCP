@@ -16,9 +16,10 @@ An AI-powered platform for querying and analyzing Tableau data using natural lan
 
 - **Dashboard Embedded AI**: AI assistant embedded directly in Tableau dashboards
 - **Context-Aware Queries**: Uses dashboard filters, selections, and parameters
-- **Filter Scope Detection**: Intelligently detects if user wants filtered or global data
+- **LLM-Powered Scope Detection**: Intelligently asks if user wants filtered or global data
+- **Multi-Dashboard Config**: YAML-based configuration for KPIs, glossary, and AI instructions
 - **Markdown Rendering**: Rich formatted responses with tables and code blocks
-- **Conversation Memory**: Multi-turn conversations within the extension
+- **Multi-Turn Memory**: 5-turn conversation history within the session
 
 ### Activity Tracking
 
@@ -74,6 +75,9 @@ An AI-powered platform for querying and analyzing Tableau data using natural lan
 ```
 tableau-mcp-agent/
 ├── backend/                        # FastAPI Backend
+│   ├── configs/                    # Dashboard YAML configs
+│   │   ├── _template.yaml         # Template for new configs
+│   │   └── superstore.yaml        # Example Superstore config
 │   ├── src/
 │   │   ├── agent/
 │   │   │   ├── dashboard_agent.py  # LangGraph Dashboard Agent
@@ -81,6 +85,8 @@ tableau-mcp-agent/
 │   │   ├── api/
 │   │   │   ├── dashboard_routes.py # Tableau Extension API
 │   │   │   └── routes/             # Other REST endpoints
+│   │   ├── services/
+│   │   │   └── config_service.py   # YAML config loader
 │   │   ├── core/                   # Config, logging, exceptions
 │   │   ├── db/                     # SQLAlchemy models & sessions
 │   │   ├── mcp/                    # MCP client
@@ -224,14 +230,51 @@ The Dashboard Agent classifies user intents:
 
 ## 🔍 Context Scope Detection
 
-When filters are active, the agent detects query scope:
+When filters are active, the agent uses **LLM-based detection** to determine if user wants filtered or global data:
 
-| User Says          | Detected Scope | Behavior               |
-| ------------------ | -------------- | ---------------------- |
-| "Top 5 products"   | `filtered`     | Uses dashboard filters |
-| "Show all regions" | `global`       | Ignores filters        |
-| "Overall total"    | `global`       | Queries all data       |
-| "In this view"     | `filtered`     | Uses current filters   |
+| User Says                    | Detected Scope | Behavior                   |
+| ---------------------------- | -------------- | -------------------------- |
+| "Top 5 products"             | `ambiguous`    | **Asks for clarification** |
+| "Top 5 in this view"         | `filtered`     | Uses dashboard filters     |
+| "Top 5 within current scope" | `filtered`     | Uses dashboard filters     |
+| "Show all regions"           | `global`       | Ignores filters            |
+| "Overall total"              | `global`       | Queries all data           |
+
+**Keywords are a fast path** for obvious cases. For ambiguous queries, the LLM classifies the scope and may ask the user to clarify.
+
+## 📋 Dashboard Configuration
+
+Add dashboard-specific context by creating YAML files in `backend/configs/`:
+
+```yaml
+# backend/configs/superstore.yaml
+version: "1.0"
+
+dashboard:
+  name: "Superstore"
+  aliases: ["Sample - Superstore", "Superstore Dashboard"]
+  description: "Retail analytics for Superstore"
+
+kpis:
+  - name: "Total Sales"
+    field: "Sales"
+    aggregation: "sum"
+    description: "Total sales in USD"
+
+glossary:
+  "revenue": "Sales"
+  "AOV": "Average Order Value"
+
+suggested_questions:
+  - question: "What are our total sales?"
+    intent: "data_query"
+
+ai_instructions: |
+  This is a retail dashboard.
+  Always mention profit margins when discussing sales.
+```
+
+**Zero-config works by default** - configs are optional enrichments.
 
 ## 🔧 Environment Variables
 

@@ -111,6 +111,19 @@ for i in {1..30}; do
     sleep 1
 done
 
+# Start demo server for Tableau Extension testing
+print_status "Starting demo server for Tableau Extension..."
+pkill -f "python3 -m http.server 8080" 2>/dev/null || true
+cd tableau-extension/src && python3 -m http.server 8080 > /dev/null 2>&1 &
+cd "$SCRIPT_DIR"
+sleep 2
+echo -n "  Demo:     "
+if curl -s http://localhost:8080/demo.html > /dev/null 2>&1; then
+    echo -e "${GREEN}Ready${NC}"
+else
+    echo -e "${YELLOW}Check manually${NC}"
+fi
+
 # Final status
 echo ""
 print_status "Checking service status..."
@@ -121,9 +134,14 @@ echo "==========================================================="
 print_success "Application is ready!"
 echo "==========================================================="
 echo ""
-echo "  📊 Frontend:  http://localhost:8501"
-echo "  🔧 Backend:   http://localhost:8000"
-echo "  📚 API Docs:  http://localhost:8000/docs"
+echo "  📊 Streamlit UI:  http://localhost:8501"
+echo "  🔧 Backend API:   http://localhost:8000"
+echo "  📚 API Docs:      http://localhost:8000/docs"
+echo "  🎨 Extension Demo: http://localhost:8080/demo.html"
+echo ""
+echo "  Tableau Extension:"
+echo "    - Test in browser: http://localhost:8080/demo.html"
+echo "    - Install TREX:    tableau-extension/src/tableau-mcp.trex"
 echo ""
 echo "  To view logs: docker compose logs -f"
 echo "  To stop:      ./start.sh --stop"

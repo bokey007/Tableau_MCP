@@ -6,10 +6,11 @@ A Tableau Dashboard Extension that provides an AI-powered natural language inter
 
 - **Natural Language Queries**: Ask questions in plain English
 - **Dashboard Context Awareness**: Uses current filters, selections, and parameters
-- **Context Scope Detection**: Intelligently detects filtered vs global queries
+- **LLM-Powered Scope Detection**: Intelligently asks if user wants filtered or global data
+- **Multi-Dashboard Config**: YAML-based KPIs, glossary, and AI instructions
 - **Markdown Rendering**: Rich formatted responses with tables and code blocks
 - **Chart Visualizations**: Chart.js powered visualizations
-- **Conversation Memory**: Multi-turn conversations with follow-up support
+- **Multi-Turn Memory**: 5-turn conversation history within the session
 - **Dark Theme UI**: Modern aesthetic matching Tableau
 
 ## 📁 Project Structure
@@ -113,12 +114,15 @@ CORS_ORIGINS=https://your-tableau-site.tableau.com
 
 ## 🔍 Context Scope Detection
 
-| User Question        | Scope    | Behavior               |
-| -------------------- | -------- | ---------------------- |
-| "Top 5 products"     | Filtered | Uses dashboard filters |
-| "Show all regions"   | Global   | Ignores filters        |
-| "In this view"       | Filtered | Uses current filters   |
-| "Company-wide total" | Global   | Queries all data       |
+The agent uses **LLM-based classification** for ambiguous queries:
+
+| User Question                | Scope         | Behavior               |
+| ---------------------------- | ------------- | ---------------------- |
+| "Top 5 products"             | **Ambiguous** | Asks for clarification |
+| "Top 5 in this view"         | Filtered      | Uses dashboard filters |
+| "Top 5 within current scope" | Filtered      | Uses dashboard filters |
+| "Show all regions"           | Global        | Ignores filters        |
+| "Company-wide total"         | Global        | Queries all data       |
 
 ## 🎨 UI Components
 
