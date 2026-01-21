@@ -99,7 +99,7 @@ services:
       BACKEND_HOST: "0.0.0.0"
       BACKEND_PORT: "8000"
       API_PREFIX: /api/v1
-      CORS_ORIGINS: "http://localhost:8501,http://localhost:3000,http://localhost:8080"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501,http://localhost:3000,http://localhost:8080}
 
       # Database
       POSTGRES_HOST: postgres

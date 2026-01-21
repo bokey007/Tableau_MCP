@@ -87,6 +87,7 @@ INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly O
 - chat (greetings, thanks, casual conversation)
 - capability (asking what you can do, help)
 - dashboard_context (asking about current filters, selections, what's shown)
+- dashboard_action (requests to CHANGE the dashboard: "filter by", "show only", "set parameter", "clear filters", "go to sheet")
 - clarification (vague question needing more detail: single words like "sales", "profit")
 - comparison (comparing time periods, regions, categories: "Q1 vs Q2", "compare East and West", "year over year")
 - anomaly (unusual patterns, outliers: "what's unusual", "anomalies", "outliers", "unexpected")
@@ -134,6 +135,35 @@ Also ask if they want to:
 2. Search across all data (global/unfiltered)
 
 Be brief and helpful."""
+
+
+DASHBOARD_ACTION_SYSTEM = """You are an AI assistant that can control a Tableau dashboard.
+Parse the user's request and return a JSON object with the action to perform.
+
+Dashboard: {dashboard_name}
+Available Worksheets: {worksheets}
+Current Filters: {filters}
+Available Parameters: {parameters}
+
+Supported actions:
+1. apply_filter - Apply a filter to a worksheet
+   {{"action": "apply_filter", "worksheet": "Sheet Name", "field": "Field Name", "values": ["value1", "value2"]}}
+   
+2. clear_filter - Clear a specific filter or all filters
+   {{"action": "clear_filter", "worksheet": "Sheet Name", "field": "Field Name"}}  # specific filter
+   {{"action": "clear_all_filters", "worksheet": "Sheet Name"}}  # all filters on worksheet
+   
+3. set_parameter - Set a parameter value
+   {{"action": "set_parameter", "name": "Parameter Name", "value": "new value"}}
+
+4. navigate - Navigate to a different worksheet/sheet
+   {{"action": "navigate", "worksheet": "Sheet Name"}}
+
+User request: {question}
+
+Respond with ONLY a valid JSON object. Include a "message" field with a friendly confirmation message.
+If the request is unclear or the field/worksheet doesn't exist, respond with:
+{{"action": "error", "message": "I couldn't find that field/worksheet. Available options are: ..."}}"""
 
 
 CONTEXT_SCOPE_SYSTEM = """You are analyzing if a user's data query should use dashboard filters or search globally.
@@ -323,6 +353,7 @@ class DashboardAgent:
         graph.add_node("handle_capability", self._handle_capability)
         graph.add_node("handle_context", self._handle_context)
         graph.add_node("handle_clarification", self._handle_clarification)
+        graph.add_node("handle_dashboard_action", self._handle_dashboard_action)
         graph.add_node("handle_data_query", self._handle_data_query)
         graph.add_node("handle_comparison", self._handle_comparison)
         graph.add_node("handle_anomaly", self._handle_anomaly)
@@ -340,6 +371,7 @@ class DashboardAgent:
                 "capability": "handle_capability",
                 "dashboard_context": "handle_context",
                 "clarification": "handle_clarification",
+                "dashboard_action": "handle_dashboard_action",
                 "data_query": "handle_data_query",
                 "comparison": "handle_comparison",
                 "anomaly": "handle_anomaly",
@@ -352,6 +384,7 @@ class DashboardAgent:
         graph.add_edge("handle_capability", END)
         graph.add_edge("handle_context", END)
         graph.add_edge("handle_clarification", END)
+        graph.add_edge("handle_dashboard_action", END)
         graph.add_edge("handle_data_query", END)
         graph.add_edge("handle_comparison", END)
         graph.add_edge("handle_anomaly", END)
@@ -368,6 +401,7 @@ class DashboardAgent:
             "chat": "chat",
             "capability": "capability",
             "dashboard_context": "dashboard_context",
+            "dashboard_action": "dashboard_action",
             "clarification_needed": "clarification",
             "clarification": "clarification",
             "data_query": "data_query",
@@ -432,7 +466,26 @@ class DashboardAgent:
             if re.search(pattern, question_lower):
                 return "capability"
         
-        # Dashboard context patterns
+        # Dashboard ACTION patterns (requests to CHANGE the dashboard)
+        action_patterns = [
+            r'filter\s+(by|to)\s+',           # "filter by Region = West"
+            r'show\s+(only|just)\s+',          # "show only West"
+            r'set\s+(the\s+)?parameter',       # "set the parameter"
+            r'change\s+(the\s+)?parameter',    # "change the parameter"
+            r'clear\s+(all\s+)?filter',        # "clear filters"
+            r'remove\s+(all\s+)?filter',       # "remove filters"
+            r'reset\s+filter',                 # "reset filters"
+            r'go\s+to\s+',                     # "go to Sales sheet"
+            r'navigate\s+to\s+',               # "navigate to..."
+            r'switch\s+to\s+',                 # "switch to..."
+            r'apply\s+(a\s+)?filter',          # "apply a filter"
+            r'filter\s+\w+\s*=',               # "filter Region = West"
+        ]
+        for pattern in action_patterns:
+            if re.search(pattern, question_lower):
+                return "dashboard_action"
+        
+        # Dashboard context patterns (asking ABOUT current state, not changing it)
         context_patterns = [
             r'what (filter|filters)',
             r'which (filter|region|segment)',
@@ -655,6 +708,66 @@ class DashboardAgent:
         except Exception as e:
             state["analysis"] = "Could you be more specific? Try: 'Total sales by region' or 'Top 5 customers'"
             state["needs_clarification"] = True
+            state["status"] = "complete"
+        
+        return state
+    
+    async def _handle_dashboard_action(self, state: DashboardAgentState) -> DashboardAgentState:
+        """Handle requests to modify the dashboard (filters, parameters, navigation)."""
+        question = state.get("question", "")
+        context = state.get("dashboard_context", {})
+        
+        dashboard_name = context.get("dashboard_name", "Dashboard")
+        worksheets = context.get("worksheets", [])
+        filters = context.get("filters", [])
+        parameters = context.get("parameters", [])
+        
+        worksheets_str = ", ".join([w.get("name", "") for w in worksheets]) if worksheets else "No worksheets detected"
+        filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
+        parameters_str = ", ".join([f"{p.get('name')}={p.get('value', '')}" for p in parameters]) if parameters else "None"
+        
+        try:
+            system_prompt = DASHBOARD_ACTION_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                worksheets=worksheets_str,
+                filters=filters_str,
+                parameters=parameters_str,
+                question=question
+            )
+            
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=question)
+            ])
+            
+            # Parse the JSON response
+            import json
+            try:
+                action_data = json.loads(response.content.strip())
+            except json.JSONDecodeError:
+                # Try to extract JSON from response
+                import re
+                json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+                if json_match:
+                    action_data = json.loads(json_match.group())
+                else:
+                    action_data = {
+                        "action": "error",
+                        "message": "I couldn't understand that action. Try 'filter by Region = West' or 'clear filters'."
+                    }
+            
+            # Build response with action command for frontend
+            state["analysis"] = action_data.get("message", "Action processed.")
+            state["results"] = {
+                "dashboard_action": action_data
+            }
+            state["status"] = "complete"
+            
+            logger.info("Dashboard action parsed", action=action_data.get("action"))
+            
+        except Exception as e:
+            logger.error("Dashboard action handler error", error=str(e))
+            state["analysis"] = "I couldn't process that action. Try: 'filter by Region = West' or 'clear all filters'."
             state["status"] = "complete"
         
         return state

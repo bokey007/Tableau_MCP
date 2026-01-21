@@ -5,8 +5,8 @@
 
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
-    // Backend API URL (your deployment)
-    API_URL: 'http://localhost:8000/api/v1',
+    // Backend API URL (Cloudflare Tunnel for HTTPS)
+    API_URL: 'https://herbs-modern-assumed-workplace.trycloudflare.com/api/v1',
     
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -25,22 +25,54 @@ let messageCount = 0;
  * Initialize the extension when Tableau is ready
  */
 document.addEventListener('DOMContentLoaded', () => {
+    log('DOM loaded, starting initialization...');
+    
+    // Set a timeout to check if Tableau ever initializes
+    setTimeout(() => {
+        if (!isInitialized) {
+            updateStatus('Waiting for Dashboard...', 'error');
+            log('Tableau initialization is taking longer than expected. Are you running inside a dashboard?');
+            
+            // Add a hint for the user
+            const hint = document.createElement('div');
+            hint.style.cssText = 'font-size: 10px; color: var(--text-secondary); text-align: center; margin-top: 5px;';
+            hint.innerHTML = 'Tip: This extension must be added to a Tableau Dashboard to work fully.';
+            document.querySelector('.header-text').appendChild(hint);
+        }
+    }, 4000);
+
     // Initialize Tableau Extensions API
-    tableau.extensions.initializeAsync().then(() => {
-        log('Tableau Extensions API initialized');
-        isInitialized = true;
-        updateStatus('Connected', 'connected');
-        
-        // Get dashboard context
-        captureDashboardContext();
-        
-        // Setup event listeners
+    try {
+        if (typeof tableau !== 'undefined' && tableau.extensions) {
+            tableau.extensions.initializeAsync().then(() => {
+                log('Tableau Extensions API initialized');
+                isInitialized = true;
+                updateStatus('Connected to Dashboard', 'connected');
+                
+                // Get dashboard context
+                captureDashboardContext();
+                
+                // Setup event listeners
+                setupEventListeners();
+                
+                addMessage('Connected to Tableau Dashboard! I have access to your data context.', 'assistant');
+            }).catch(err => {
+                log('Failed to initialize Tableau Extensions API', err);
+                updateStatus('API Error', 'error');
+                addMessage(`Warning: Tableau API failed to initialize (${err.message}). I will try to function in standalone mode.`, 'assistant');
+                setupEventListeners(); // Still allow typing
+            });
+        } else {
+            log('Tableau object not found. Running in standalone mode.');
+            updateStatus('Standalone Mode', 'warning');
+            setupEventListeners();
+            addMessage('I am running in <strong>standalone mode</strong> (no dashboard connection). Some data context might be missing, but we can still talk!', 'assistant');
+        }
+    } catch (e) {
+        log('Initialization error', e);
+        updateStatus('Init Error', 'error');
         setupEventListeners();
-        
-    }).catch(err => {
-        log('Failed to initialize Tableau Extensions API', err);
-        updateStatus('Error: ' + err.message, 'error');
-    });
+    }
 });
 
 /**
@@ -147,9 +179,9 @@ async function sendMessage() {
     // Add user message to chat
     addMessage(message, 'user');
     
-    // Check streaming mode
+    // Check streaming mode - Default to TRUE for better performance
     const streamingCheckbox = document.getElementById('streamingMode');
-    const useStreaming = streamingCheckbox ? streamingCheckbox.checked : false;
+    const useStreaming = streamingCheckbox ? streamingCheckbox.checked : true;
     
     if (useStreaming) {
         await sendMessageWithStreaming(message);
@@ -184,7 +216,10 @@ async function sendMessageWithStreaming(message) {
         
         const response = await fetch(`${CONFIG.API_URL}/dashboard/query/stream`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+                'Content-Type': 'application/json',
+                'ngrok-skip-browser-warning': '69420'
+            },
             body: JSON.stringify(requestBody)
         });
         
@@ -249,8 +284,24 @@ function handleStreamEvent(event, loadingId) {
             const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
                 ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
                 : '';
+            
+            // Check if this is a dashboard action
+            const isAction = data.intent === 'dashboard_action' || (data.results && data.results.dashboard_action);
+            const actionBadge = isAction 
+                ? `<span style="background: #ed8936; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">⚡ action</span>` 
+                : '';
+                
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
-            addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
+            addMessage(intentBadge + queryTypeBadge + actionBadge + analysisHtml, 'assistant');
+            
+            // Execute dashboard action if present
+            if (data.results && data.results.dashboard_action) {
+                executeDashboardAction(data.results.dashboard_action).then(actionResult => {
+                    if (actionResult) {
+                        addMessage('✅ Dashboard updated!', 'assistant');
+                    }
+                });
+            }
             
             // Only render visualization if BOTH exist and have actual data
             const hasVisualization = data.visualization && typeof data.visualization === 'object' && Object.keys(data.visualization).length > 0 && data.visualization.chart_type;
@@ -308,7 +359,8 @@ async function sendMessageStandard(message) {
         const response = await fetch(`${CONFIG.API_URL}/dashboard/query`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'ngrok-skip-browser-warning': '69420' // Bypass ngrok warning page
             },
             body: JSON.stringify(requestBody)
         });
@@ -341,8 +393,23 @@ async function sendMessageStandard(message) {
             const queryTypeBadge = data.query_type && data.query_type !== 'standard' 
                 ? `<span style="background: #48bb78; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">${data.query_type}</span>` 
                 : '';
+            
+            // Check if this is a dashboard action
+            const isAction = data.intent === 'dashboard_action' || (data.results && data.results.dashboard_action);
+            const actionBadge = isAction 
+                ? `<span style="background: #ed8936; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-right: 8px;">⚡ action</span>` 
+                : '';
+            
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
-            addMessage(intentBadge + queryTypeBadge + analysisHtml, 'assistant');
+            addMessage(intentBadge + queryTypeBadge + actionBadge + analysisHtml, 'assistant');
+            
+            // Execute dashboard action if present
+            if (data.results && data.results.dashboard_action) {
+                const actionResult = await executeDashboardAction(data.results.dashboard_action);
+                if (actionResult) {
+                    addMessage('✅ Dashboard updated!', 'assistant');
+                }
+            }
             
             // Only render visualization if BOTH exist and have actual data
             const hasVisualization = data.visualization && typeof data.visualization === 'object' && Object.keys(data.visualization).length > 0 && data.visualization.chart_type;
@@ -624,3 +691,212 @@ function log(message, data) {
         console.log(`[AI Agent] ${message}`, data || '');
     }
 }
+
+// =============================================================================
+// Dashboard Action Execution
+// =============================================================================
+
+/**
+ * Execute a dashboard action returned by the agent
+ */
+async function executeDashboardAction(actionData) {
+    if (!actionData || !actionData.action) {
+        log('No action to execute');
+        return false;
+    }
+    
+    const action = actionData.action;
+    log('Executing dashboard action', actionData);
+    
+    // Check if Tableau API is available
+    if (typeof tableau === 'undefined' || !tableau.extensions) {
+        log('Tableau API not available - action skipped');
+        return false;
+    }
+    
+    try {
+        const dashboard = tableau.extensions.dashboardContent.dashboard;
+        
+        switch (action) {
+            case 'apply_filter':
+                return await applyFilter(dashboard, actionData);
+                
+            case 'clear_filter':
+                return await clearFilter(dashboard, actionData);
+                
+            case 'clear_all_filters':
+                return await clearAllFilters(dashboard, actionData);
+                
+            case 'set_parameter':
+                return await setParameter(dashboard, actionData);
+                
+            case 'navigate':
+                return await navigateToSheet(dashboard, actionData);
+                
+            case 'error':
+                // Error from agent - just show the message, no action
+                return false;
+                
+            default:
+                log('Unknown action type', action);
+                return false;
+        }
+    } catch (err) {
+        log('Dashboard action failed', err);
+        return false;
+    }
+}
+
+/**
+ * Apply a filter to a worksheet
+ */
+async function applyFilter(dashboard, actionData) {
+    const worksheetName = actionData.worksheet;
+    const fieldName = actionData.field;
+    const values = actionData.values || [];
+    
+    // Find the worksheet
+    const worksheet = dashboard.worksheets.find(ws => 
+        ws.name.toLowerCase() === worksheetName.toLowerCase()
+    );
+    
+    if (!worksheet) {
+        // Try to find by partial match
+        const partialMatch = dashboard.worksheets.find(ws => 
+            ws.name.toLowerCase().includes(worksheetName.toLowerCase())
+        );
+        if (!partialMatch) {
+            log('Worksheet not found', worksheetName);
+            return false;
+        }
+        worksheet = partialMatch;
+    }
+    
+    // Apply the categorical filter
+    await worksheet.applyFilterAsync(
+        fieldName,
+        values,
+        tableau.FilterUpdateType.Replace
+    );
+    
+    log('Filter applied', { worksheet: worksheetName, field: fieldName, values });
+    
+    // Refresh context after action
+    setTimeout(() => captureDashboardContext(), 500);
+    
+    return true;
+}
+
+/**
+ * Clear a specific filter
+ */
+async function clearFilter(dashboard, actionData) {
+    const worksheetName = actionData.worksheet;
+    const fieldName = actionData.field;
+    
+    const worksheet = dashboard.worksheets.find(ws => 
+        ws.name.toLowerCase().includes(worksheetName.toLowerCase())
+    );
+    
+    if (!worksheet) {
+        log('Worksheet not found for clear', worksheetName);
+        return false;
+    }
+    
+    await worksheet.clearFilterAsync(fieldName);
+    log('Filter cleared', { worksheet: worksheetName, field: fieldName });
+    
+    // Refresh context after action
+    setTimeout(() => captureDashboardContext(), 500);
+    
+    return true;
+}
+
+/**
+ * Clear all filters on a worksheet
+ */
+async function clearAllFilters(dashboard, actionData) {
+    const worksheetName = actionData.worksheet;
+    
+    // If no worksheet specified, try to clear on all worksheets
+    const worksheets = worksheetName 
+        ? dashboard.worksheets.filter(ws => ws.name.toLowerCase().includes(worksheetName.toLowerCase()))
+        : dashboard.worksheets;
+    
+    for (const worksheet of worksheets) {
+        try {
+            const filters = await worksheet.getFiltersAsync();
+            for (const filter of filters) {
+                if (filter.filterType === 'categorical') {
+                    await worksheet.clearFilterAsync(filter.fieldName);
+                }
+            }
+        } catch (e) {
+            log('Error clearing filters on worksheet', { worksheet: worksheet.name, error: e });
+        }
+    }
+    
+    log('All filters cleared');
+    
+    // Refresh context after action
+    setTimeout(() => captureDashboardContext(), 500);
+    
+    return true;
+}
+
+/**
+ * Set a parameter value
+ */
+async function setParameter(dashboard, actionData) {
+    const paramName = actionData.name;
+    const value = actionData.value;
+    
+    try {
+        // Get the parameter by name
+        const parameters = await dashboard.getParametersAsync();
+        const param = parameters.find(p => 
+            p.name.toLowerCase().includes(paramName.toLowerCase())
+        );
+        
+        if (!param) {
+            log('Parameter not found', paramName);
+            return false;
+        }
+        
+        await param.changeValueAsync(value);
+        log('Parameter set', { name: paramName, value });
+        
+        // Refresh context after action
+        setTimeout(() => captureDashboardContext(), 500);
+        
+        return true;
+    } catch (e) {
+        log('Error setting parameter', e);
+        return false;
+    }
+}
+
+/**
+ * Navigate to a different worksheet/sheet
+ */
+async function navigateToSheet(dashboard, actionData) {
+    const sheetName = actionData.worksheet;
+    
+    // Find the worksheet or sheet
+    const worksheet = dashboard.worksheets.find(ws => 
+        ws.name.toLowerCase().includes(sheetName.toLowerCase())
+    );
+    
+    if (worksheet) {
+        // In Tableau extensions, you can't directly navigate to a sheet
+        // but you can make a sheet visible/active via the dashboard layout
+        // For now, we'll just log it
+        log('Navigation requested', { sheet: sheetName });
+        addMessage(`📍 Please manually navigate to "${sheetName}" sheet.`, 'assistant');
+        return true;
+    }
+    
+    log('Sheet not found for navigation', sheetName);
+    return false;
+}
+
