@@ -59,7 +59,7 @@ services:
       # MCP Settings
       DANGEROUSLY_DISABLE_OAUTH: "true"
       ENABLE_SERVER_LOGGING: "true"
-      DEFAULT_LOG_LEVEL: info
+      DEFAULT_LOG_LEVEL: debug
     ports:
       - "3927:3927"
     healthcheck:
