@@ -75,6 +75,9 @@ logs/
 # Docker
 .docker/
 
+# Node modules (local development only)
+node_modules/
+
 # OS
 .DS_Store
 Thumbs.db
