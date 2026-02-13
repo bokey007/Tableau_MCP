@@ -146,25 +146,36 @@ Available Worksheets: {worksheets}
 Current Filters: {filters}
 Available Parameters: {parameters}
 
-Supported actions:
-1. apply_filter - Apply a filter to a worksheet
-   {{"action": "apply_filter", "worksheet": "Sheet Name", "field": "Field Name", "values": ["value1", "value2"]}}
-   
-2. clear_filter - Clear a specific filter or all filters
-   {{"action": "clear_filter", "worksheet": "Sheet Name", "field": "Field Name"}}  # specific filter
-   {{"action": "clear_all_filters", "worksheet": "Sheet Name"}}  # all filters on worksheet
-   
-3. set_parameter - Set a parameter value
-   {{"action": "set_parameter", "name": "Parameter Name", "value": "new value"}}
+CRITICAL RULES:
+1. You MUST ONLY use worksheet names from the "Available Worksheets" list above.
+2. Do NOT invent worksheet names like "Overview", "Sheet1", or anything not in the list.
+3. When the user says "filter dashboard by X" or "filter by X", use worksheet "all" to apply across ALL worksheets.
+4. When the user says "clear all filters" without specifying a worksheet, use worksheet "all".
+5. For "Region" filters, the field name is "Region". For date filters, use "Order Date".
 
-4. navigate - Navigate to a different worksheet/sheet
-   {{"action": "navigate", "worksheet": "Sheet Name"}}
+Supported actions:
+1. apply_filter - Apply a filter to one or ALL worksheets
+   {{"action": "apply_filter", "worksheet": "all", "field": "Region", "values": ["East"], "message": "Filter applied..."}}
+   {{"action": "apply_filter", "worksheet": "Sale Map", "field": "Region", "values": ["West"], "message": "Filter applied..."}}
+   
+2. clear_filter - Clear a specific filter
+   {{"action": "clear_filter", "worksheet": "all", "field": "Region", "message": "Filter cleared..."}}
+
+3. clear_all_filters - Clear all filters on one or all worksheets
+   {{"action": "clear_all_filters", "worksheet": "all", "message": "All filters cleared..."}}
+   
+4. set_parameter - Set a parameter value
+   {{"action": "set_parameter", "name": "Parameter Name", "value": "new value", "message": "Parameter set..."}}
+
+5. navigate - Navigate to a different worksheet/sheet
+   {{"action": "navigate", "worksheet": "Sheet Name", "message": "Navigating..."}}
 
 User request: {question}
 
 Respond with ONLY a valid JSON object. Include a "message" field with a friendly confirmation message.
-If the request is unclear or the field/worksheet doesn't exist, respond with:
-{{"action": "error", "message": "I couldn't find that field/worksheet. Available options are: ..."}}"""
+If the request is unclear, respond with:
+{{"action": "error", "message": "I couldn't understand that. Available worksheets: {worksheets}. Try 'filter by Region = West' or 'clear all filters'."}}"""
+
 
 
 CONTEXT_SCOPE_SYSTEM = """You are analyzing if a user's data query should use dashboard filters or search globally.

@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://midnight-bras-determination-proposed.trycloudflare.com/api/v1',
+    API_URL: 'https://lewis-collected-updated-technologies.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -150,11 +150,16 @@ async function captureDashboardContext() {
                         filterValue = appliedValues.map(v => v.value).join(', ');
                     }
                 } else if (filter.filterType === 'range') {
-                    const minVal = filter.minValue?.formattedValue || filter.minValue?.value || filter.minValue || '';
-                    const maxVal = filter.maxValue?.formattedValue || filter.maxValue?.value || filter.maxValue || '';
-                    if (minVal || maxVal) {
+                    const minVal = filter.minValue?.formattedValue || filter.minValue?.value || '';
+                    const maxVal = filter.maxValue?.formattedValue || filter.maxValue?.value || '';
+                    if (minVal && maxVal) {
                         filterValue = `${minVal} - ${maxVal}`;
+                    } else if (minVal) {
+                        filterValue = `from ${minVal}`;
+                    } else if (maxVal) {
+                        filterValue = `up to ${maxVal}`;
                     }
+                    // If both are empty/null, filterValue stays null (filter will be skipped)
                 }
 
                 dashboardContext.filters.push({
@@ -817,7 +822,29 @@ async function applyFilter(dashboard, actionData) {
     const fieldName = actionData.field;
     const values = actionData.values || [];
 
-    // Find the worksheet
+    // If worksheet is "all", apply filter to ALL worksheets
+    if (worksheetName && worksheetName.toLowerCase() === 'all') {
+        let anySuccess = false;
+        for (const ws of dashboard.worksheets) {
+            try {
+                await ws.applyFilterAsync(
+                    fieldName,
+                    values,
+                    tableau.FilterUpdateType.Replace
+                );
+                log('🎯 Filter applied to worksheet:', ws.name);
+                anySuccess = true;
+            } catch (err) {
+                log('⚠️ Could not apply filter to worksheet:', ws.name, err.message);
+            }
+        }
+        if (anySuccess) {
+            setTimeout(() => captureDashboardContext(), 800);
+        }
+        return anySuccess;
+    }
+
+    // Find the specific worksheet
     let worksheet = dashboard.worksheets.find(ws =>
         ws.name.toLowerCase() === worksheetName.toLowerCase()
     );
@@ -862,6 +889,22 @@ async function applyFilter(dashboard, actionData) {
 async function clearFilter(dashboard, actionData) {
     const worksheetName = actionData.worksheet;
     const fieldName = actionData.field;
+
+    // If "all", clear this filter on all worksheets
+    if (worksheetName && worksheetName.toLowerCase() === 'all') {
+        let anySuccess = false;
+        for (const ws of dashboard.worksheets) {
+            try {
+                await ws.clearFilterAsync(fieldName);
+                log('Filter cleared on worksheet:', ws.name);
+                anySuccess = true;
+            } catch (err) {
+                log('⚠️ Could not clear filter on:', ws.name, err.message);
+            }
+        }
+        setTimeout(() => captureDashboardContext(), 500);
+        return anySuccess;
+    }
 
     const worksheet = dashboard.worksheets.find(ws =>
         ws.name.toLowerCase().includes(worksheetName.toLowerCase())
