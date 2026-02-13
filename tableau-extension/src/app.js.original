@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://midnight-bras-determination-proposed.trycloudflare.com/api/v1',
+    API_URL: 'https://ambient-causes-pittsburgh-straight.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -141,6 +141,15 @@ async function captureDashboardContext() {
             // Get filters from each worksheet
             const filters = await worksheet.getFiltersAsync();
             for (const filter of filters) {
+                // Skip Tableau internal Action filters
+                if (filter.fieldName.startsWith('Action ') || filter.fieldName.startsWith('Action(')) {
+                    continue;
+                }
+                // Skip computed aggregates and boolean calc fields
+                if (filter.fieldName.startsWith('AGG(') || filter.fieldName.endsWith('?')) {
+                    continue;
+                }
+
                 let filterValue = null;
 
                 // Try to get filter value based on type
@@ -162,14 +171,30 @@ async function captureDashboardContext() {
                     // If both are empty/null, filterValue stays null (filter will be skipped)
                 }
 
-                dashboardContext.filters.push({
-                    worksheet: worksheet.name,
-                    field: filter.fieldName,
-                    type: filter.filterType,
-                    value: filterValue
-                });
+                // Only add filters that have actual values
+                if (filterValue) {
+                    dashboardContext.filters.push({
+                        worksheet: worksheet.name,
+                        field: filter.fieldName,
+                        type: filter.filterType,
+                        value: filterValue
+                    });
+                }
             }
         }
+
+        // De-duplicate filters across worksheets (only show one per field)
+        const uniqueFilters = [];
+        const seenFields = new Set();
+
+        for (const f of dashboardContext.filters) {
+            const key = `${f.field}:${f.value}`;
+            if (!seenFields.has(key)) {
+                uniqueFilters.push(f);
+                seenFields.add(key);
+            }
+        }
+        dashboardContext.filters = uniqueFilters;
 
         // Get datasources
         const datasources = await tableau.extensions.dashboardContent.dashboard.worksheets[0]?.getDataSourcesAsync();

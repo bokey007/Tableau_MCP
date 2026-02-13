@@ -440,6 +440,13 @@ class DashboardAgent:
         # Add user message to conversation history
         state["messages"] = [HumanMessage(content=question)]
         
+        # Clear previous turn results to prevent ghosting in memory
+        state["results"] = None
+        state["visualization"] = None
+        state["analysis"] = None
+        state["error"] = None
+        state["context_scope"] = None
+        
         # Heuristic classification (fast path)
         intent = self._classify_by_heuristics(question_lower)
         
@@ -727,6 +734,9 @@ class DashboardAgent:
         context = state.get("dashboard_context", {})
         filters = context.get("filters", [])
         
+        # Sanitize filters to remove problematic fields before query planning
+        filters = self._sanitize_filters(filters)
+        
         logger.info("Delegating to Data Agent", question=question[:50])
         
         try:
@@ -791,7 +801,7 @@ class DashboardAgent:
         """Handle comparison queries (Q1 vs Q2, year-over-year, region comparisons)."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
-        filters = context.get("filters", [])
+        filters = self._sanitize_filters(context.get("filters", []))
         
         logger.info("Handling comparison query", question=question[:50])
         state["query_type"] = "comparison"
@@ -853,7 +863,7 @@ This is a comparison query. Please:
         """Handle anomaly detection queries (outliers, unusual patterns)."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
-        filters = context.get("filters", [])
+        filters = self._sanitize_filters(context.get("filters", []))
         
         logger.info("Handling anomaly detection query", question=question[:50])
         state["query_type"] = "anomaly"
@@ -916,7 +926,7 @@ This is an anomaly detection query. Please:
         """Handle storytelling/narrative queries (executive summaries, presentations)."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
-        filters = context.get("filters", [])
+        filters = self._sanitize_filters(context.get("filters", []))
         dashboard_name = context.get("dashboard_name", "Dashboard")
         
         logger.info("Handling storytelling query", question=question[:50])
@@ -1077,13 +1087,53 @@ Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
             f'- "{example[1]} **across all data**" for global results'
         )
     
+    def _sanitize_filters(self, filters: List[Dict]) -> List[Dict]:
+        """Remove filters with problematic field names that VizQL cannot process.
+        
+        Strips out:
+        - Action filters (e.g. 'Action (MONTH(Order Date), Segment)')
+        - Computed aggregates (e.g. 'AGG(Profit Ratio)')
+        - Boolean calc fields ending with '?' (e.g. 'Order Profitable?')
+        - Filters with null/empty/None values
+        """
+        if not filters:
+            return []
+        
+        clean = []
+        for f in filters:
+            field = f.get("field", "")
+            value = f.get("value")
+            
+            # Skip filters with no value
+            if not value or str(value).lower() in ("none", "null", "null - null"):
+                continue
+            
+            # Skip Action filters (Tableau internal)
+            if field.startswith("Action ") or field.startswith("Action("):
+                continue
+            
+            # Skip computed aggregates like AGG(Profit Ratio)
+            if field.startswith("AGG(") or field.startswith("SUM(") or field.startswith("AVG("):
+                continue
+            
+            # Skip boolean calc fields ending with '?'
+            if field.endswith("?"):
+                continue
+            
+            clean.append(f)
+        
+        return clean
+    
     def _build_filter_context(self, filters: List[Dict]) -> str:
         """Build a human-readable filter context string."""
         if not filters:
             return ""
         
+        # Sanitize first to remove problematic fields
+        clean_filters = self._sanitize_filters(filters)
+        
         filter_parts = []
-        for f in filters:
+        for f in clean_filters:
             field = f.get("field", "")
             value = f.get("value")
             if field and value:
