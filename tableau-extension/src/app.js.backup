@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://midnight-bras-determination-proposed.trycloudflare.com/api/v1',
+    API_URL: 'https://johnston-spoke-simplified-coordinator.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -150,11 +150,7 @@ async function captureDashboardContext() {
                         filterValue = appliedValues.map(v => v.value).join(', ');
                     }
                 } else if (filter.filterType === 'range') {
-                    const minVal = filter.minValue?.formattedValue || filter.minValue?.value || filter.minValue || '';
-                    const maxVal = filter.maxValue?.formattedValue || filter.maxValue?.value || filter.maxValue || '';
-                    if (minVal || maxVal) {
-                        filterValue = `${minVal} - ${maxVal}`;
-                    }
+                    filterValue = `${filter.minValue} - ${filter.maxValue}`;
                 }
 
                 dashboardContext.filters.push({

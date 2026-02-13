@@ -86,13 +86,13 @@ class DashboardAgentState(TypedDict, total=False):
 INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly ONE word from:
 - chat (greetings, thanks, casual conversation)
 - capability (asking what you can do, help)
-- dashboard_context (asking about current filters, selections, what's shown)
-- dashboard_action (requests to CHANGE the dashboard: "filter by", "show only", "set parameter", "clear filters", "go to sheet")
+- dashboard_context (asking about current filters, selections, what's shown, what datasources are used, what worksheets exist)
+- dashboard_action (requests to CHANGE the dashboard: "filter by", "filter dashboard by", "show only", "set parameter", "clear filters", "go to sheet". IMPORTANT: if the user says "filter" + a value/region/category, this is ALWAYS dashboard_action, even if they include the word "dashboard")
 - clarification (vague question needing more detail: single words like "sales", "profit")
 - comparison (comparing time periods, regions, categories: "Q1 vs Q2", "compare East and West", "year over year")
 - anomaly (unusual patterns, outliers: "what's unusual", "anomalies", "outliers", "unexpected")
 - storytelling (narrative summary, presentation: "summarize", "tell me the story", "executive summary")
-- data_query (standard data analysis: "top 5 customers", "total sales by region")
+- data_query (standard data analysis: "top 5 customers", "total sales by region". NOT for filter/action requests)
 
 Question: {question}
 Dashboard Context: {context}
@@ -121,8 +121,9 @@ CONTEXT_RESPONSE_SYSTEM = """You are an AI assistant explaining the current dash
 Dashboard: {dashboard_name}
 Active Filters: {filters}
 Worksheets: {worksheets}
+Datasources: {datasources}
 
-Answer the user's question about what's currently shown/selected."""
+Answer the user's question about what's currently shown/selected, including datasource names if asked."""
 
 
 CLARIFICATION_SYSTEM = """The user's question is too vague. Ask for clarification with 2-3 specific suggestions.
@@ -440,9 +441,9 @@ class DashboardAgent:
         return state
     
     def _classify_by_heuristics(self, question_lower: str) -> Optional[str]:
-        """Fast heuristic classification for common patterns."""
+        """Fast heuristic classification for common greetings/casual chatter."""
         
-        # Chat patterns
+        # Chat patterns (simple greetings and polite phrases)
         chat_patterns = [
             r'^(hi|hello|hey|good morning|good afternoon|good evening)[\s!.,]*$',
             r'^(thanks|thank you|thx|ty)[\s!.,]*$',
@@ -453,114 +454,42 @@ class DashboardAgent:
             if re.match(pattern, question_lower):
                 return "chat"
         
-        # Capability patterns
+        # Capability patterns (asking "what can you do")
         capability_patterns = [
             r'what can you do',
-            r'how do (i|you) use',
-            r'help me',
             r'^help$',
-            r'what (are your|features)',
             r'how does this work',
         ]
         for pattern in capability_patterns:
             if re.search(pattern, question_lower):
                 return "capability"
         
-        # Dashboard ACTION patterns (requests to CHANGE the dashboard)
+        # Dashboard action patterns (filter/clear/set commands)
         action_patterns = [
-            r'filter\s+(by|to)\s+',           # "filter by Region = West"
-            r'show\s+(only|just)\s+',          # "show only West"
-            r'set\s+(the\s+)?parameter',       # "set the parameter"
-            r'change\s+(the\s+)?parameter',    # "change the parameter"
-            r'clear\s+(all\s+)?filter',        # "clear filters"
-            r'remove\s+(all\s+)?filter',       # "remove filters"
-            r'reset\s+filter',                 # "reset filters"
-            r'go\s+to\s+',                     # "go to Sales sheet"
-            r'navigate\s+to\s+',               # "navigate to..."
-            r'switch\s+to\s+',                 # "switch to..."
-            r'apply\s+(a\s+)?filter',          # "apply a filter"
-            r'filter\s+\w+\s*=',               # "filter Region = West"
+            r'(?:filter|show only|switch to|go to|set)\s+(?:the\s+)?(?:dashboard\s+)?(?:by|to)\s+',
+            r'filter\s+(?:the\s+)?dashboard',
+            r'clear\s+(?:all\s+)?filters',
+            r'remove\s+(?:all\s+)?filters',
         ]
         for pattern in action_patterns:
             if re.search(pattern, question_lower):
                 return "dashboard_action"
         
-        # Dashboard context patterns (asking ABOUT current state, not changing it)
+        # Dashboard context patterns (asking about what's visible)
         context_patterns = [
-            r'what (filter|filters)',
-            r'which (filter|region|segment)',
-            r'current(ly)? (filter|select)',
-            r'what.*(selected|applied|shown)',
-            r'what am i (looking at|viewing)',
+            r'(?:what|which)\s+(?:is|are)\s+(?:the\s+)?(?:active\s+)?datasource',
+            r'(?:what|which)\s+datasource',
+            r'what\s+worksheets',
+            r'what\s+sheets',
         ]
         for pattern in context_patterns:
             if re.search(pattern, question_lower):
                 return "dashboard_context"
         
-        # Clarification needed (very short/vague)
-        if len(question_lower.split()) <= 2:
-            vague_words = ['sales', 'profit', 'revenue', 'customers', 'data', 'show', 'analyze']
-            if question_lower.strip('?!. ') in vague_words:
-                return "clarification"
+        # Note: All other analytical intents (queries, anomalies, storytelling) 
+        # are intentionally left to the LLM classifier for better accuracy.
         
-        # Comparison patterns (before generic data_query)
-        comparison_patterns = [
-            r'compare\s+\w+\s+(to|with|vs|versus|and)\s+\w+',
-            r'\bvs\.?\b',
-            r'\bversus\b',
-            r'(q[1-4]|quarter)\s*(vs|to|and)\s*(q[1-4]|quarter)',
-            r'(year|yoy)\s*(over|on)\s*year',
-            r'compare.*region',
-            r'(difference|differ)\s+(between|from)',
-            r'how does.*compare',
-            r'(this|last)\s+(year|month|quarter).*compare',
-        ]
-        for pattern in comparison_patterns:
-            if re.search(pattern, question_lower):
-                return "comparison"
-        
-        # Anomaly detection patterns
-        anomaly_patterns = [
-            r"what'?s?\s+(unusual|weird|strange|odd|abnormal)",
-            r'(find|detect|show|identify)\s*(the)?\s*(anomal|outlier|unusual)',
-            r'\b(anomal|outlier)s?\b',
-            r'(unexpected|unusual)\s+(pattern|trend|value)',
-            r'(spike|drop|deviation)',
-            r'(something|anything)\s+(wrong|off|unusual)',
-            r'red flags?',
-        ]
-        for pattern in anomaly_patterns:
-            if re.search(pattern, question_lower):
-                return "anomaly"
-        
-        # Storytelling patterns
-        storytelling_patterns = [
-            r'(tell|give)\s+(me)?\s*(the)?\s*(story|narrative)',
-            r'(executive|exec)\s+summary',
-            r'summarize\s+(the|this)?\s*(dashboard|data|view)',
-            r'presentation\s+(bullet|summary)',
-            r'explain\s+(this|the)\s+(dashboard|view)',
-            r'what\s+(is|does)\s+this\s+(dashboard|data)\s+(show|tell)',
-            r'big\s+picture',
-            r'key\s+(takeaway|insight|finding)s?',
-        ]
-        for pattern in storytelling_patterns:
-            if re.search(pattern, question_lower):
-                return "storytelling"
-        
-        # Explicit data query patterns
-        data_patterns = [
-            r'(top|bottom)\s+\d+',
-            r'(total|sum|average|avg|count|max|min)\s+',
-            r'(trend|over time|by year|by month)',
-            r'how (much|many)',
-            r'what (is|are|was|were) (the|our)',
-        ]
-        for pattern in data_patterns:
-            if re.search(pattern, question_lower):
-                return "data_query"
-        
-        return None  # Needs LLM classification
+        return None  # Fallback to LLM
     
     async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
         """Use LLM for ambiguous intent classification."""
@@ -575,8 +504,8 @@ class DashboardAgent:
             intent = response.content.strip().lower()
             
             valid_intents = [
-                "chat", "capability", "dashboard_context", "clarification", 
-                "data_query", "comparison", "anomaly", "storytelling"
+                "chat", "capability", "dashboard_context", "dashboard_action",
+                "clarification", "data_query", "comparison", "anomaly", "storytelling"
             ]
             if intent in valid_intents:
                 return intent
@@ -660,12 +589,15 @@ class DashboardAgent:
         
         filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
         worksheets_str = ", ".join([w.get("name", "") for w in worksheets]) if worksheets else "Unknown"
+        datasources = context.get("datasources", [])
+        datasources_str = ", ".join([ds.get("name", "") for ds in datasources]) if datasources else "Unknown"
         
         try:
             system_prompt = CONTEXT_RESPONSE_SYSTEM.format(
                 dashboard_name=dashboard_name,
                 filters=filters_str,
-                worksheets=worksheets_str
+                worksheets=worksheets_str,
+                datasources=datasources_str
             )
             
             response = await self.llm.ainvoke([
@@ -726,6 +658,12 @@ class DashboardAgent:
         filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
         parameters_str = ", ".join([f"{p.get('name')}={p.get('value', '')}" for p in parameters]) if parameters else "None"
         
+        if not worksheets:
+            state["analysis"] = "I can't see any worksheets in your dashboard. If you're running this in Tableau, try refreshing the extension. If you're in standalone mode, some dashboard actions won't be available."
+            state["intent"] = "clarification"
+            state["status"] = "complete"
+            return state
+
         try:
             system_prompt = DASHBOARD_ACTION_SYSTEM.format(
                 dashboard_name=dashboard_name,
@@ -826,7 +764,9 @@ class DashboardAgent:
                     else "All data (global)"
                 )
                 state["analysis"] = f"{scope_indicator}\n\n{state['analysis']}"
-                state["analysis"] = self._enrich_with_context(state["analysis"], context)
+                # Only show dashboard context footer when filters were actually applied
+                if context_scope == "filtered":
+                    state["analysis"] = self._enrich_with_context(state["analysis"], context)
             
         except Exception as e:
             logger.error("Data query failed", error=str(e))
