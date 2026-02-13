@@ -429,7 +429,12 @@ class DashboardAgent:
     # =========================================================================
     
     async def _classify_intent(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Classify user intent using heuristics + LLM fallback."""
+        """Classify user intent using heuristics + LLM fallback.
+        
+        Handles follow-up scope answers: if the previous turn asked a scope
+        clarification question, the user's reply (e.g. 'across all the data')
+        is detected and the original query is re-executed with the resolved scope.
+        """
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
         config = state.get("dashboard_config")
@@ -437,7 +442,7 @@ class DashboardAgent:
         
         logger.info("Classifying intent", question=question[:50])
         
-        # Add user message to conversation history
+        # Add user message to conversation history (appended via 'add' reducer)
         state["messages"] = [HumanMessage(content=question)]
         
         # Clear previous turn results to prevent ghosting in memory
@@ -447,16 +452,74 @@ class DashboardAgent:
         state["error"] = None
         state["context_scope"] = None
         
+        # ── Follow-up scope answer detection ──
+        # If the previous turn asked a scope clarification, treat this message
+        # as a scope answer rather than a brand-new query.
+        if state.get("needs_clarification"):
+            resolved_scope = self._parse_scope_answer(question_lower)
+            if resolved_scope:
+                logger.info("Scope answer detected", scope=resolved_scope, question=question[:50])
+                # Force the scope and re-classify the *original* pending question
+                state["context_scope"] = resolved_scope
+                state["needs_clarification"] = False
+                
+                # Recover the original question from conversation history
+                prior_messages = state.get("messages", [])
+                original_question = None
+                # Walk backwards through messages to find the last user question
+                # that was NOT a scope answer
+                for msg in reversed(prior_messages):
+                    if isinstance(msg, HumanMessage) and msg.content != question:
+                        original_question = msg.content
+                        break
+                
+                if original_question:
+                    state["question"] = original_question
+                    question = original_question
+                    question_lower = question.lower().strip()
+                    logger.info("Re-running original question with resolved scope", 
+                               question=question[:50], scope=resolved_scope)
+                else:
+                    # Fallback: ask user again
+                    state["intent"] = "clarification"
+                    logger.info("Could not recover original question, asking for clarification")
+                    return state
+        
         # Heuristic classification (fast path)
         intent = self._classify_by_heuristics(question_lower)
         
         if intent is None:
-            # LLM fallback for ambiguous cases
+            # LLM fallback for ambiguous cases — include conversation context
             intent = await self._classify_by_llm(question, context, config)
         
         state["intent"] = intent
+        state["needs_clarification"] = False  # Reset for this turn
         logger.info("Intent classified", intent=intent)
         return state
+    
+    def _parse_scope_answer(self, answer_lower: str) -> Optional[str]:
+        """Parse a follow-up message as a scope answer.
+        
+        Returns 'global', 'filtered', or None if it doesn't look like a scope answer.
+        """
+        global_keywords = [
+            "all data", "all the data", "across all", "global", "everything",
+            "ignoring filter", "without filter", "entire", "whole dataset",
+        ]
+        filtered_keywords = [
+            "current view", "this view", "filtered", "as shown",
+            "with filter", "current", "what's shown", "in scope",
+        ]
+        
+        for kw in global_keywords:
+            if kw in answer_lower:
+                return "global"
+        for kw in filtered_keywords:
+            if kw in answer_lower:
+                return "filtered"
+        
+        return None
+
     
     def _classify_by_heuristics(self, question_lower: str) -> Optional[str]:
         """Fast heuristic classification for common greetings/casual chatter."""
@@ -602,7 +665,7 @@ class DashboardAgent:
         context = state.get("dashboard_context", {})
         
         dashboard_name = context.get("dashboard_name", "Dashboard")
-        filters = context.get("filters", [])
+        filters = self._sanitize_filters(context.get("filters", []))
         worksheets = context.get("worksheets", [])
         
         filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
@@ -740,11 +803,13 @@ class DashboardAgent:
         logger.info("Delegating to Data Agent", question=question[:50])
         
         try:
-            # Detect context scope: filtered (use dashboard filters) or global (all data)
-            context_scope = await self._detect_context_scope(question, filters)
-            state["context_scope"] = context_scope
+            # Use pre-resolved scope (from follow-up answer) or detect it
+            context_scope = state.get("context_scope")
+            if not context_scope:
+                context_scope = await self._detect_context_scope(question, filters)
+                state["context_scope"] = context_scope
             
-            logger.info("Context scope detected", scope=context_scope, filters_count=len(filters))
+            logger.info("Context scope resolved", scope=context_scope, filters_count=len(filters))
             
             # Handle ambiguous scope - ask user
             if context_scope == "ambiguous" and filters:
@@ -819,9 +884,11 @@ This is a comparison query. Please:
 5. Highlight the winner/better performer
 6. Note the biggest differences"""
             
-            # Detect scope and execute
-            context_scope = await self._detect_context_scope(question, filters)
-            state["context_scope"] = context_scope
+            # Use pre-resolved scope or detect it
+            context_scope = state.get("context_scope")
+            if not context_scope:
+                context_scope = await self._detect_context_scope(question, filters)
+                state["context_scope"] = context_scope
             
             # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
@@ -882,9 +949,11 @@ This is an anomaly detection query. Please:
 6. Rate each anomaly by severity (High/Medium/Low)
 7. Suggest possible root causes"""
             
-            # Detect scope and execute
-            context_scope = await self._detect_context_scope(question, filters)
-            state["context_scope"] = context_scope
+            # Use pre-resolved scope or detect it
+            context_scope = state.get("context_scope")
+            if not context_scope:
+                context_scope = await self._detect_context_scope(question, filters)
+                state["context_scope"] = context_scope
             
             # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
@@ -950,9 +1019,11 @@ Please create a compelling data story:
 5. Provide 3 actionable next steps
 6. Keep it concise but insightful - suitable for an exec presentation"""
             
-            # Detect scope and execute
-            context_scope = await self._detect_context_scope(question, filters)
-            state["context_scope"] = context_scope
+            # Use pre-resolved scope or detect it
+            context_scope = state.get("context_scope")
+            if not context_scope:
+                context_scope = await self._detect_context_scope(question, filters)
+                state["context_scope"] = context_scope
             
             # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
@@ -1218,7 +1289,7 @@ Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
     
     def _enrich_with_context(self, analysis: str, context: DashboardContext) -> str:
         """Add filter context to analysis."""
-        filters = context.get("filters", [])
+        filters = self._sanitize_filters(context.get("filters", []))
         if not filters:
             return analysis
         
