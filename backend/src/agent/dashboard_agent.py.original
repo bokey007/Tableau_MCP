@@ -88,7 +88,7 @@ INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly O
 - chat (greetings, thanks, casual conversation)
 - capability (asking what you can do, help)
 - dashboard_context (asking about current filters, selections, what's shown, what datasources are used, what worksheets exist)
-- dashboard_action (requests to CHANGE the dashboard: "filter by", "filter dashboard by", "show only", "set parameter", "clear filters", "go to sheet". IMPORTANT: if the user says "filter" + a value/region/category, this is ALWAYS dashboard_action, even if they include the word "dashboard")
+- dashboard_action (requests to CHANGE the dashboard: "filter by", "filter dashboard by", "show only", "set parameter", "clear filters", "go to sheet". Also includes context-switching: "shift focus to X", "let's look at X", "zoom into X", "narrow down to X", "switch to X", "focus on X", "move to X". ANY request that implies changing what the dashboard displays is dashboard_action, even if phrased conversationally. IMPORTANT: if the user says "filter" + a value/region/category, this is ALWAYS dashboard_action)
 - clarification (vague question needing more detail: single words like "sales", "profit")
 - comparison (comparing time periods, regions, categories: "Q1 vs Q2", "compare East and West", "year over year")
 - anomaly (unusual patterns, outliers: "what's unusual", "anomalies", "outliers", "unexpected")
