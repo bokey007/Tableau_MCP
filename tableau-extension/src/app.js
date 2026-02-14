@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://resulting-cotton-recorders-specialties.trycloudflare.com/api/v1',
+    API_URL: 'https://thinking-postcard-roland-webmaster.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
