@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://ambient-causes-pittsburgh-straight.trycloudflare.com/api/v1',
+    API_URL: 'https://resulting-cotton-recorders-specialties.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -564,8 +564,8 @@ function renderVisualization(vizConfig, data) {
 
     log('Chart axes mapped', { xAxis, yAxis, labelKey, valueKey });
 
-    // Extract labels and values (limit to 10)
-    const chartData = data.slice(0, 10);
+    // Use all data points for chart
+    const chartData = data;
     const labels = chartData.map(row => {
         const val = row[labelKey];
         return typeof val === 'string' && val.length > 25 ? val.substring(0, 22) + '...' : val;
@@ -699,7 +699,7 @@ function removeMessage(id) {
 /**
  * Add data preview table
  */
-function addDataPreview(data, maxRows = 5) {
+function addDataPreview(data, maxRows = 50) {
     if (!data || data.length === 0) return;
 
     const container = document.getElementById('chatContainer');
@@ -711,9 +711,9 @@ function addDataPreview(data, maxRows = 5) {
 
     let tableHtml = `
         <div class="message-content">
-            <div class="data-table">
+            <div class="data-table" style="max-height: 300px; overflow-y: auto;">
                 <table>
-                    <thead>
+                    <thead style="position: sticky; top: 0; z-index: 1;">
                         <tr>${columns.map(col => `<th>${col}</th>`).join('')}</tr>
                     </thead>
                     <tbody>
