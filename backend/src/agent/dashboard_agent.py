@@ -475,12 +475,8 @@ class DashboardAgent:
         if not scope_followup:
             state["context_scope"] = None
         
-        # Heuristic classification (fast path)
-        intent = self._classify_by_heuristics(question_lower)
-        
-        if intent is None:
-            # LLM fallback for ambiguous cases
-            intent = await self._classify_by_llm(question, context, dashboard_config)
+        # LLM-powered intent classification (no heuristic fast-path)
+        intent = await self._classify_by_llm(question, context, dashboard_config)
         
         state["intent"] = intent
         state["needs_clarification"] = False
@@ -561,57 +557,6 @@ Intent:"""
             logger.warning("LLM scope parsing failed, falling back", error=str(e))
             return None
 
-    
-    def _classify_by_heuristics(self, question_lower: str) -> Optional[str]:
-        """Fast heuristic classification for common greetings/casual chatter."""
-        
-        # Chat patterns (simple greetings and polite phrases)
-        chat_patterns = [
-            r'^(hi|hello|hey|good morning|good afternoon|good evening)[\s!.,]*$',
-            r'^(thanks|thank you|thx|ty)[\s!.,]*$',
-            r'^(bye|goodbye|see you)[\s!.,]*$',
-            r'^how are you',
-        ]
-        for pattern in chat_patterns:
-            if re.match(pattern, question_lower):
-                return "chat"
-        
-        # Capability patterns (asking "what can you do")
-        capability_patterns = [
-            r'what can you do',
-            r'^help$',
-            r'how does this work',
-        ]
-        for pattern in capability_patterns:
-            if re.search(pattern, question_lower):
-                return "capability"
-        
-        # Dashboard action patterns (filter/clear/set commands)
-        action_patterns = [
-            r'(?:filter|show only|switch to|go to|set)\s+(?:the\s+)?(?:dashboard\s+)?(?:by|to)\s+',
-            r'filter\s+(?:the\s+)?dashboard',
-            r'clear\s+(?:all\s+)?filters',
-            r'remove\s+(?:all\s+)?filters',
-        ]
-        for pattern in action_patterns:
-            if re.search(pattern, question_lower):
-                return "dashboard_action"
-        
-        # Dashboard context patterns (asking about what's visible)
-        context_patterns = [
-            r'(?:what|which)\s+(?:is|are)\s+(?:the\s+)?(?:active\s+)?datasource',
-            r'(?:what|which)\s+datasource',
-            r'what\s+worksheets',
-            r'what\s+sheets',
-        ]
-        for pattern in context_patterns:
-            if re.search(pattern, question_lower):
-                return "dashboard_context"
-        
-        # Note: All other analytical intents (queries, anomalies, storytelling) 
-        # are intentionally left to the LLM classifier for better accuracy.
-        
-        return None  # Fallback to LLM
     
     async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
         """Use LLM for ambiguous intent classification."""
@@ -1109,43 +1054,18 @@ Please create a compelling data story:
     async def _detect_context_scope(self, question: str, filters: List[Dict]) -> str:
         """
         Detect whether user wants filtered (dashboard context) or global (all data) results.
-        Uses LLM for intelligent classification when keywords don't clearly indicate intent.
+        Fully LLM-powered for dynamic, natural language understanding.
         
         Returns:
             'filtered' - Apply dashboard filters to query
             'global' - Search all data ignoring filters
-            'ambiguous' - Unclear even to LLM, should ask user
+            'ambiguous' - Unclear, should ask user
         """
-        question_lower = question.lower()
-        
-        # No filters = always global
+        # No filters = always global (logical shortcut, not keyword-based)
         if not filters:
             return "global"
         
-        # Fast path: Explicit keywords (avoid LLM call for obvious cases)
-        
-        # Explicit global keywords
-        global_patterns = [
-            "across all", "all regions", "all categories", "all time",
-            "overall", "total across", "globally", "ignoring filter",
-            "without filter", "entire dataset", "all data", "company-wide",
-            "organization-wide", "regardless of filter", "everywhere"
-        ]
-        for pattern in global_patterns:
-            if pattern in question_lower:
-                return "global"
-        
-        # Explicit filtered keywords
-        filtered_patterns = [
-            "this region", "current filter", "as filtered", "what's shown",
-            "in this view", "with these filters", "selected", "currently applied",
-            "filtered data", "current view", "here", "current scope", "within scope"
-        ]
-        for pattern in filtered_patterns:
-            if pattern in question_lower:
-                return "filtered"
-        
-        # LLM-based classification for ambiguous queries
+        # LLM-based classification
         try:
             filter_context = self._build_filter_context(filters)
             
