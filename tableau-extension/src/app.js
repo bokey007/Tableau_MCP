@@ -699,7 +699,7 @@ function removeMessage(id) {
 /**
  * Add data preview table
  */
-function addDataPreview(data, maxRows = 50) {
+function addDataPreview(data, maxRows = 100) {
     if (!data || data.length === 0) return;
 
     const container = document.getElementById('chatContainer');
