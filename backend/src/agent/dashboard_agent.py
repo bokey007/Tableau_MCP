@@ -512,6 +512,16 @@ class DashboardAgent:
         """
         if not history:
             return None
+        
+        # Dashboard action phrases should NOT be treated as scope answers
+        action_phrases = [
+            "shift focus", "switch to", "zoom into", "narrow down to",
+            "focus on", "move to", "filter by", "filter dashboard",
+            "show only", "clear filter", "clear all", "set parameter",
+            "go to sheet", "navigate to", "let's look at",
+        ]
+        if any(phrase in current_lower for phrase in action_phrases):
+            return None
             
         # The history contains everything UP TO the current turn.
         # We need to find the last HumanMessage and the last AIMessage after it.
@@ -591,6 +601,20 @@ Intent:"""
             'global', 'filtered', or None.
         """
         if not history or len(history) < 2:
+            return (current_question, None)
+        
+        # ── Dashboard action phrases should NOT be rewritten ──
+        # These must pass through to the intent classifier as-is
+        q_lower = current_question.lower()
+        action_phrases = [
+            "shift focus", "switch to", "zoom into", "narrow down to",
+            "focus on", "move to", "filter by", "filter dashboard",
+            "show only", "clear filter", "clear all", "set parameter",
+            "go to sheet", "navigate to", "let's look at",
+        ]
+        if any(phrase in q_lower for phrase in action_phrases):
+            logger.info("Skipping follow-up resolution — dashboard action detected",
+                       question=current_question[:50])
             return (current_question, None)
         
         # ── Deterministic scope extraction from previous AI response ──
