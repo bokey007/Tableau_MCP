@@ -450,8 +450,8 @@ class DashboardAgent:
         # CRITICAL: Read history BEFORE we append the current message.
         history = state.get("messages", [])
         
-        # Detect follow-up using history
-        scope_followup = self._detect_scope_followup(history, question, question_lower)
+        # Detect follow-up using history (async — calls LLM for scope parsing)
+        scope_followup = await self._detect_scope_followup(history, question, question_lower)
         
         if scope_followup:
             original_question, resolved_scope = scope_followup
@@ -487,7 +487,7 @@ class DashboardAgent:
         logger.info("Intent classified", intent=intent)
         return state
     
-    def _detect_scope_followup(
+    async def _detect_scope_followup(
         self, history: List[BaseMessage], current_question: str, current_lower: str
     ) -> Optional[tuple]:
         """Check if the current message is a follow-up to a scope clarification.
@@ -523,59 +523,43 @@ class DashboardAgent:
         if not is_scope_clarification:
             return None
         
-        # Parse scope answer
-        resolved_scope = self._parse_scope_answer(current_lower)
+        # Use LLM to parse scope answer
+        resolved_scope = await self._parse_scope_answer(current_lower, last_ai.content)
         return (last_human.content, resolved_scope) if resolved_scope else None
     
-    def _parse_scope_answer(self, answer_lower: str) -> Optional[str]:
-        """Parse a follow-up message as a scope answer.
+    async def _parse_scope_answer(self, user_reply: str, ai_clarification: str) -> Optional[str]:
+        """Use LLM to interpret a user's reply to a scope clarification question.
         
-        Returns 'global', 'filtered', or None if it doesn't look like a scope answer.
+        Returns 'global', 'filtered', or None if the reply is unrelated.
         """
-        # Pre-process: fix common typos
-        typo_fixes = {
-            "pn ": "on ", "acroos": "across", "accross": "across",
-            "compelte": "complete", "complte": "complete",
-            "everthing": "everything", "everyting": "everything",
-            "gloabl": "global", "globl": "global",
-            "filterd": "filtered", "fltered": "filtered",
-        }
-        cleaned = answer_lower
-        for typo, fix in typo_fixes.items():
-            cleaned = cleaned.replace(typo, fix)
-        
-        # Global keywords (explicit intent to avoid filters)
-        global_keywords = [
-            "all data", "all the data", "across all", "global", "everything",
-            "ignoring filter", "without filter", "entire", "whole dataset",
-            "regardless of filter", "all regions", "all categories",
-            "across the data", "across data",
-            "complete data", "the complete data", "on complete",
-            "full data", "full dataset", "total data", "overall",
-            "unfiltered", "no filter", "remove filter",
-            "whole data", "entire data", "entire dataset",
-            "option 2", "second option", "2",  # Numbered choice
-        ]
-        # Filtered keywords (explicit intent to use dashboard filters)
-        filtered_keywords = [
-            "current view", "this view", "filtered", "as shown",
-            "with filter", "current", "what's shown", "in scope",
-            "this region", "selected only", "within view", "local",
-            "as is", "what i see", "visible", "on screen",
-            "option 1", "first option", "1",  # Numbered choice
-        ]
-        
-        # Check global first (more explicit)
-        for kw in global_keywords:
-            if kw in cleaned:
-                return "global"
-        
-        # Check filtered
-        for kw in filtered_keywords:
-            if kw in cleaned:
-                return "filtered"
-        
-        return None
+        try:
+            prompt = f"""You are interpreting a user's reply to a data scope question.
+
+The AI previously asked:
+\"\"\"{ai_clarification}\"\"\"
+
+The user replied:
+\"\"\"{user_reply}\"\"\"
+
+Classify the user's intent. Respond with exactly ONE word:
+- global  (user wants ALL data, ignoring dashboard filters — e.g. "all data", "everything", "complete data", "across all", "the whole thing", "option 2", "second one")
+- filtered  (user wants the CURRENT VIEW with active filters — e.g. "current view", "as shown", "this view", "with the filter", "option 1", "first one", "yes the filtered one")
+- unknown  (the reply is unrelated to scope — e.g. a completely new question, greeting, or gibberish)
+
+Intent:"""
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            result = response.content.strip().lower()
+            
+            if result in ("global", "filtered"):
+                logger.info("LLM scope answer parsed", reply=user_reply[:40], scope=result)
+                return result
+            
+            logger.info("LLM scope answer: unknown/unrelated", reply=user_reply[:40], result=result)
+            return None
+            
+        except Exception as e:
+            logger.warning("LLM scope parsing failed, falling back", error=str(e))
+            return None
 
     
     def _classify_by_heuristics(self, question_lower: str) -> Optional[str]:
