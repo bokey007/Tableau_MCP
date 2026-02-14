@@ -446,11 +446,11 @@ class DashboardAgent:
         thread_id = config.get("configurable", {}).get("thread_id", "unknown") if config else "unknown"
         logger.info("Classifying intent", question=question[:50], thread_id=thread_id)
         
-        # ── Follow-up scope answer detection (message-based) ──
+        # ── Conversational follow-up resolution (message-based) ──
         # CRITICAL: Read history BEFORE we append the current message.
         history = state.get("messages", [])
         
-        # Detect follow-up using history (async — calls LLM for scope parsing)
+        # 1) Check if this is a scope-clarification answer (narrow check)
         scope_followup = await self._detect_scope_followup(history, question, question_lower)
         
         if scope_followup:
@@ -461,6 +461,22 @@ class DashboardAgent:
             state["question"] = original_question
             question = original_question
             question_lower = question.lower().strip()
+        else:
+            # 2) Check if this is a broader conversational follow-up
+            #    e.g. "and for tech category?" after a sales trend result
+            resolved_q, prev_scope = await self._resolve_conversational_followup(
+                history, question
+            )
+            if resolved_q != question:
+                logger.info("Conversational follow-up resolved",
+                           original=question[:40], resolved=resolved_q[:60],
+                           carried_scope=prev_scope)
+                state["question"] = resolved_q
+                question = resolved_q
+                question_lower = question.lower().strip()
+                # Carry forward the scope from the previous exchange
+                if prev_scope:
+                    state["context_scope"] = prev_scope
         
         # NOW append user message to conversation history (appended via 'add' reducer)
         state["messages"] = [HumanMessage(content=question)]
@@ -471,8 +487,8 @@ class DashboardAgent:
         state["analysis"] = None
         state["error"] = None
         
-        # If we didn't just resolve scope from history, reset it
-        if not scope_followup:
+        # If we didn't resolve scope from follow-up, reset it
+        if not scope_followup and state.get("context_scope") is None:
             state["context_scope"] = None
         
         # LLM-powered intent classification (no heuristic fast-path)
@@ -556,6 +572,88 @@ Intent:"""
         except Exception as e:
             logger.warning("LLM scope parsing failed, falling back", error=str(e))
             return None
+
+    async def _resolve_conversational_followup(
+        self, history: List[BaseMessage], current_question: str
+    ) -> tuple:
+        """Use LLM to detect conversational follow-ups and resolve them.
+        
+        Detects when the current message is a continuation of a previous exchange
+        (e.g. "and for tech category?" after a sales trend answer) and rewrites
+        it into a complete standalone question.
+        
+        Also extracts the scope preference from the previous exchange so it can
+        be carried forward without re-asking the user.
+        
+        Returns:
+            (resolved_question, previous_scope) — resolved_question equals
+            current_question if no follow-up was detected; previous_scope is
+            'global', 'filtered', or None.
+        """
+        if not history or len(history) < 2:
+            return (current_question, None)
+        
+        # Build recent conversation context (last 6 messages max)
+        recent = history[-6:]
+        conv_lines = []
+        for msg in recent:
+            role = "User" if isinstance(msg, HumanMessage) else "AI"
+            conv_lines.append(f"{role}: {msg.content[:300]}")
+        conversation_context = "\n".join(conv_lines)
+        
+        try:
+            prompt = f"""You are an expert data analyst assistant. Analyze whether the user's latest message is a follow-up to the ongoing conversation.
+
+Recent conversation:
+{conversation_context}
+
+User's latest message: "{current_question}"
+
+Determine:
+1. Is this a FOLLOW-UP to a previous query (e.g. refining, extending, or asking for a variation)?
+2. If yes, rewrite it as a COMPLETE standalone question that includes all necessary context from the conversation.
+3. What data scope was used in the previous exchange? (global/filtered/none)
+
+Examples of follow-ups:
+- "and for tech category?" after sales trend → "What is the sales trend for the Technology category?"
+- "what about East?" after region analysis → "Show me the same analysis for the East region"
+- "now compare with last year" → "Compare the current results with last year's data"
+- "break it down by month" → "Break down the sales trend by month"
+
+Respond in EXACTLY this format (3 lines, no extra text):
+IS_FOLLOWUP: yes/no
+RESOLVED_QUESTION: <the complete standalone question, or the original if not a follow-up>
+PREVIOUS_SCOPE: global/filtered/none"""
+
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            lines = response.content.strip().split("\n")
+            
+            is_followup = False
+            resolved = current_question
+            prev_scope = None
+            
+            for line in lines:
+                line = line.strip()
+                if line.lower().startswith("is_followup:"):
+                    is_followup = "yes" in line.lower()
+                elif line.lower().startswith("resolved_question:"):
+                    resolved = line.split(":", 1)[1].strip().strip('"')
+                elif line.lower().startswith("previous_scope:"):
+                    scope_val = line.split(":", 1)[1].strip().lower()
+                    if scope_val in ("global", "filtered"):
+                        prev_scope = scope_val
+            
+            if is_followup and resolved and resolved != current_question:
+                logger.info("Follow-up resolved by LLM",
+                           original=current_question[:40],
+                           resolved=resolved[:60])
+                return (resolved, prev_scope)
+            
+            return (current_question, prev_scope)
+            
+        except Exception as e:
+            logger.warning("Follow-up resolution failed", error=str(e))
+            return (current_question, None)
 
     
     async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
@@ -792,7 +890,7 @@ Intent:"""
             # Use pre-resolved scope (from follow-up answer) or detect it
             context_scope = state.get("context_scope")
             if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters)
+                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
                 state["context_scope"] = context_scope
             
             logger.info("Context scope resolved", scope=context_scope, filters_count=len(filters))
@@ -875,7 +973,7 @@ This is a comparison query. Please:
             # Use pre-resolved scope or detect it
             context_scope = state.get("context_scope")
             if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters)
+                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
                 state["context_scope"] = context_scope
             
             # Handle ambiguous scope
@@ -942,7 +1040,7 @@ This is an anomaly detection query. Please:
             # Use pre-resolved scope or detect it
             context_scope = state.get("context_scope")
             if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters)
+                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
                 state["context_scope"] = context_scope
             
             # Handle ambiguous scope
@@ -1014,7 +1112,7 @@ Please create a compelling data story:
             # Use pre-resolved scope or detect it
             context_scope = state.get("context_scope")
             if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters)
+                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
                 state["context_scope"] = context_scope
             
             # Handle ambiguous scope
@@ -1051,44 +1149,61 @@ Please create a compelling data story:
         
         return state
     
-    async def _detect_context_scope(self, question: str, filters: List[Dict]) -> str:
+    async def _detect_context_scope(self, question: str, filters: List[Dict], history: List[BaseMessage] = None) -> str:
         """
         Detect whether user wants filtered (dashboard context) or global (all data) results.
-        Fully LLM-powered for dynamic, natural language understanding.
+        Fully LLM-powered. Uses conversation history for scope memory so users
+        aren't repeatedly asked the same scope question.
         
         Returns:
             'filtered' - Apply dashboard filters to query
             'global' - Search all data ignoring filters
-            'ambiguous' - Unclear, should ask user
+            'ambiguous' - Unclear, should ask user (only on first ambiguous query)
         """
-        # No filters = always global (logical shortcut, not keyword-based)
+        # No filters = always global (logical shortcut)
         if not filters:
             return "global"
         
-        # LLM-based classification
+        # Build conversation context for scope memory
+        conv_context = ""
+        if history:
+            recent = history[-6:]
+            conv_lines = []
+            for msg in recent:
+                role = "User" if isinstance(msg, HumanMessage) else "AI"
+                # Truncate long messages but keep scope indicators
+                content = msg.content[:200]
+                conv_lines.append(f"{role}: {content}")
+            conv_context = "\nRecent conversation:\n" + "\n".join(conv_lines)
+        
+        # LLM-based classification with conversation memory
         try:
             filter_context = self._build_filter_context(filters)
             
-            scope_prompt = f"""You are analyzing a user's query to determine their data scope intent.
+            scope_prompt = f"""You are determining what data scope a user wants for their query.
 
 Current dashboard filters: {filter_context}
+{conv_context}
 
-User question: "{question}"
+User's current question: "{question}"
 
-Based on the question, determine if the user wants:
-- FILTERED: Results limited to the current dashboard filters ({filter_context})
-- GLOBAL: Results from all data, ignoring the dashboard filters
-- AMBIGUOUS: Cannot determine intent, need to ask user
+Determine the user's data scope intent. Respond with exactly one word:
+- FILTERED: User wants results limited to the current dashboard filters
+- GLOBAL: User wants all data, ignoring dashboard filters
+- AMBIGUOUS: Cannot determine — BUT only if the user has NOT already expressed a scope preference in the conversation above
 
-Consider:
-- Questions about "top", "best", "highest" without context specifiers are typically AMBIGUOUS
-- Questions referencing "current", "this view", "selected", "here" suggest FILTERED
-- Questions with "all", "overall", "entire", "company-wide" suggest GLOBAL
-- Questions that are conversational or off-topic (greetings, personal) should return GLOBAL
+Key rules:
+- If the user previously chose "all data" / "global" in the conversation, default to GLOBAL (don't re-ask)
+- If the user previously chose "current view" / "filtered" in the conversation, default to FILTERED (don't re-ask)
+- If the AI previously mentioned "Data Scope: All data" in a response, the user prefers GLOBAL
+- If the AI previously mentioned "Data Scope: Filtered" in a response, the user prefers FILTERED
+- Only return AMBIGUOUS if this is the FIRST time scope is unclear AND there's no prior preference
+- Questions referencing "this view", "here", "current" suggest FILTERED
+- Questions with "all", "overall", "across all" suggest GLOBAL
 
 Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
 
-            response = await self.llm.ainvoke([{"role": "user", "content": scope_prompt}])
+            response = await self.llm.ainvoke([HumanMessage(content=scope_prompt)])
             result = response.content.strip().upper()
             
             if "FILTERED" in result:
