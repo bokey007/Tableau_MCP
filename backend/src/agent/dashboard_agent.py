@@ -582,8 +582,8 @@ Intent:"""
         (e.g. "and for tech category?" after a sales trend answer) and rewrites
         it into a complete standalone question.
         
-        Also extracts the scope preference from the previous exchange so it can
-        be carried forward without re-asking the user.
+        Scope is extracted deterministically from the AI's "Data Scope:" indicator
+        in the previous response — NOT from the LLM's interpretation.
         
         Returns:
             (resolved_question, previous_scope) — resolved_question equals
@@ -592,6 +592,18 @@ Intent:"""
         """
         if not history or len(history) < 2:
             return (current_question, None)
+        
+        # ── Deterministic scope extraction from previous AI response ──
+        # Look for our own "Data Scope:" indicator in the last AI message
+        prev_scope = None
+        for msg in reversed(history):
+            if isinstance(msg, AIMessage):
+                content = msg.content
+                if "Data Scope: All data" in content or "Data Scope: All Data" in content:
+                    prev_scope = "global"
+                elif "Data Scope: Filtered" in content:
+                    prev_scope = "filtered"
+                break  # Only check the most recent AI message
         
         # Build recent conversation context (last 6 messages max)
         recent = history[-6:]
@@ -602,35 +614,29 @@ Intent:"""
         conversation_context = "\n".join(conv_lines)
         
         try:
-            prompt = f"""You are an expert data analyst assistant. Analyze whether the user's latest message is a follow-up to the ongoing conversation.
+            prompt = f"""You are an expert data analyst assistant. Determine if the user's latest message is a follow-up to the previous conversation.
 
 Recent conversation:
 {conversation_context}
 
 User's latest message: "{current_question}"
 
-Determine:
-1. Is this a FOLLOW-UP to a previous query (e.g. refining, extending, or asking for a variation)?
-2. If yes, rewrite it as a COMPLETE standalone question that includes all necessary context from the conversation.
-3. What data scope was used in the previous exchange? (global/filtered/none)
+Rules:
+1. If this is a FOLLOW-UP (refining, extending, or asking for a variation of a previous query), rewrite it as a COMPLETE standalone analytical question.
+2. CRITICAL: Do NOT include any region, filter, or dashboard context in the resolved question. Write a PURE analytical question.
+   - WRONG: "What is the sales trend for Technology in Region=West?"
+   - RIGHT: "What is the sales trend for the Technology category?"
+3. The data scope (global vs filtered) is managed separately — do not mention it in the question.
 
-Examples of follow-ups:
-- "and for tech category?" after sales trend → "What is the sales trend for the Technology category?"
-- "what about East?" after region analysis → "Show me the same analysis for the East region"
-- "now compare with last year" → "Compare the current results with last year's data"
-- "break it down by month" → "Break down the sales trend by month"
-
-Respond in EXACTLY this format (3 lines, no extra text):
+Respond in EXACTLY this format (2 lines, no extra text):
 IS_FOLLOWUP: yes/no
-RESOLVED_QUESTION: <the complete standalone question, or the original if not a follow-up>
-PREVIOUS_SCOPE: global/filtered/none"""
+RESOLVED_QUESTION: <the clean standalone question, or the original if not a follow-up>"""
 
             response = await self.llm.ainvoke([HumanMessage(content=prompt)])
             lines = response.content.strip().split("\n")
             
             is_followup = False
             resolved = current_question
-            prev_scope = None
             
             for line in lines:
                 line = line.strip()
@@ -638,22 +644,20 @@ PREVIOUS_SCOPE: global/filtered/none"""
                     is_followup = "yes" in line.lower()
                 elif line.lower().startswith("resolved_question:"):
                     resolved = line.split(":", 1)[1].strip().strip('"')
-                elif line.lower().startswith("previous_scope:"):
-                    scope_val = line.split(":", 1)[1].strip().lower()
-                    if scope_val in ("global", "filtered"):
-                        prev_scope = scope_val
             
             if is_followup and resolved and resolved != current_question:
                 logger.info("Follow-up resolved by LLM",
                            original=current_question[:40],
-                           resolved=resolved[:60])
+                           resolved=resolved[:60],
+                           deterministic_scope=prev_scope)
                 return (resolved, prev_scope)
             
             return (current_question, prev_scope)
             
         except Exception as e:
             logger.warning("Follow-up resolution failed", error=str(e))
-            return (current_question, None)
+            return (current_question, prev_scope)
+
 
     
     async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
