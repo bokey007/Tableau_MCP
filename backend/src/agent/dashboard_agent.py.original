@@ -512,16 +512,7 @@ class DashboardAgent:
         """
         if not history:
             return None
-        
-        # Dashboard action phrases should NOT be treated as scope answers
-        action_phrases = [
-            "shift focus", "switch to", "zoom into", "narrow down to",
-            "focus on", "move to", "filter by", "filter dashboard",
-            "show only", "clear filter", "clear all", "set parameter",
-            "go to sheet", "navigate to", "let's look at",
-        ]
-        if any(phrase in current_lower for phrase in action_phrases):
-            return None
+
             
         # The history contains everything UP TO the current turn.
         # We need to find the last HumanMessage and the last AIMessage after it.
@@ -566,7 +557,7 @@ The user replied:
 Classify the user's intent. Respond with exactly ONE word:
 - global  (user wants ALL data, ignoring dashboard filters — e.g. "all data", "everything", "complete data", "across all", "the whole thing", "option 2", "second one")
 - filtered  (user wants the CURRENT VIEW with active filters — e.g. "current view", "as shown", "this view", "with the filter", "option 1", "first one", "yes the filtered one")
-- unknown  (the reply is unrelated to scope — e.g. a completely new question, greeting, or gibberish)
+- unknown  (the reply is unrelated to scope — this includes dashboard commands like changing filters, switching focus to a region/category, navigating, or any request that implies modifying the dashboard rather than answering the scope question)
 
 Intent:"""
             response = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -603,20 +594,6 @@ Intent:"""
         if not history or len(history) < 2:
             return (current_question, None)
         
-        # ── Dashboard action phrases should NOT be rewritten ──
-        # These must pass through to the intent classifier as-is
-        q_lower = current_question.lower()
-        action_phrases = [
-            "shift focus", "switch to", "zoom into", "narrow down to",
-            "focus on", "move to", "filter by", "filter dashboard",
-            "show only", "clear filter", "clear all", "set parameter",
-            "go to sheet", "navigate to", "let's look at",
-        ]
-        if any(phrase in q_lower for phrase in action_phrases):
-            logger.info("Skipping follow-up resolution — dashboard action detected",
-                       question=current_question[:50])
-            return (current_question, None)
-        
         # ── Deterministic scope extraction from previous AI response ──
         # Look for our own "Data Scope:" indicator in the last AI message
         prev_scope = None
@@ -646,11 +623,12 @@ Recent conversation:
 User's latest message: "{current_question}"
 
 Rules:
-1. If this is a FOLLOW-UP (refining, extending, or asking for a variation of a previous query), rewrite it as a COMPLETE standalone analytical question.
-2. CRITICAL: Do NOT include any region, filter, or dashboard context in the resolved question. Write a PURE analytical question.
+1. If the user is requesting a CHANGE to the dashboard (e.g. changing filters, switching to a different region/category, navigating, clearing filters, or any command that implies modifying what the dashboard displays), this is NOT a follow-up. Return IS_FOLLOWUP: no and keep the original message.
+2. If this IS a data follow-up (refining, extending, or asking for a variation of a previous analytical query), rewrite it as a COMPLETE standalone analytical question.
+3. CRITICAL: Do NOT include any region, filter, or dashboard context in the resolved question. Write a PURE analytical question.
    - WRONG: "What is the sales trend for Technology in Region=West?"
    - RIGHT: "What is the sales trend for the Technology category?"
-3. The data scope (global vs filtered) is managed separately — do not mention it in the question.
+4. The data scope (global vs filtered) is managed separately — do not mention it in the question.
 
 Respond in EXACTLY this format (2 lines, no extra text):
 IS_FOLLOWUP: yes/no
