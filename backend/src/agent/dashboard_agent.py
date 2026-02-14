@@ -1192,18 +1192,16 @@ Current dashboard filters: {filter_context}
 User's current question: "{question}"
 
 Determine the user's data scope intent. Respond with exactly one word:
-- FILTERED: User wants results limited to the current dashboard filters
-- GLOBAL: User wants all data, ignoring dashboard filters
-- AMBIGUOUS: Cannot determine — BUT only if the user has NOT already expressed a scope preference in the conversation above
+- FILTERED: User explicitly wants results limited to the current dashboard filters
+- GLOBAL: User explicitly wants all data, ignoring dashboard filters
+- AMBIGUOUS: User has NOT specified a scope preference
 
-Key rules:
-- If the user previously chose "all data" / "global" in the conversation, default to GLOBAL (don't re-ask)
-- If the user previously chose "current view" / "filtered" in the conversation, default to FILTERED (don't re-ask)
-- If the AI previously mentioned "Data Scope: All data" in a response, the user prefers GLOBAL
-- If the AI previously mentioned "Data Scope: Filtered" in a response, the user prefers FILTERED
-- Only return AMBIGUOUS if this is the FIRST time scope is unclear AND there's no prior preference
-- Questions referencing "this view", "here", "current" suggest FILTERED
-- Questions with "all", "overall", "across all" suggest GLOBAL
+CRITICAL rules (follow in order):
+1. If the question contains explicit global signals ("all data", "complete data", "across all", "overall", "entire dataset", "globally", "whole data", "ignoring filters", "without filters"), return GLOBAL
+2. If the question contains explicit filtered signals ("this view", "here", "current view", "as filtered", "with these filters", "in this scope"), return FILTERED
+3. If conversation history shows the user previously chose a scope (look for "Data Scope: All data" or "Data Scope: Filtered" in AI responses), carry that preference forward — return the same scope
+4. If NONE of the above apply (generic question like "What is the sales trend?" with no scope words and no prior preference), return AMBIGUOUS
+5. When in doubt, return AMBIGUOUS — it is better to ask the user than to guess wrong
 
 Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
 
