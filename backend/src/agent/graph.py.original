@@ -1568,17 +1568,20 @@ Available calculator tools:
             if val is None:
                 continue
             
+            col_lower = col.lower()
             str_val = str(val)
             
-            # Check for numeric values (handles "2,938.72", "-123.45", etc.)
-            clean_val = str_val.replace(',', '').replace('$', '').replace('%', '').strip()
-            # More robust numeric check: allows one decimal point and one leading minus sign
-            if clean_val.replace('.', '', 1).replace('-', '', 1).isdigit():
-                numeric_cols.append(col)
-            elif any(pattern in col.lower() for pattern in ['date', 'time', 'year', 'month', 'day']):
+            # FIRST: Check column NAME for date/time patterns (even if value is numeric)
+            # This ensures "Year" columns with values like 2022 are treated as temporal
+            if any(pattern in col_lower for pattern in ['date', 'time', 'year', 'month', 'day', 'quarter', 'period', 'week']):
                 date_cols.append(col)
             else:
-                string_cols.append(col)
+                # Check for numeric values (handles "2,938.72", "-123.45", etc.)
+                clean_val = str_val.replace(',', '').replace('$', '').replace('%', '').strip()
+                if clean_val.replace('.', '', 1).replace('-', '', 1).isdigit():
+                    numeric_cols.append(col)
+                else:
+                    string_cols.append(col)
         
         # Recommendation logic
         if date_cols and numeric_cols:

@@ -532,28 +532,47 @@ class DashboardAgent:
         
         Returns 'global', 'filtered', or None if it doesn't look like a scope answer.
         """
+        # Pre-process: fix common typos
+        typo_fixes = {
+            "pn ": "on ", "acroos": "across", "accross": "across",
+            "compelte": "complete", "complte": "complete",
+            "everthing": "everything", "everyting": "everything",
+            "gloabl": "global", "globl": "global",
+            "filterd": "filtered", "fltered": "filtered",
+        }
+        cleaned = answer_lower
+        for typo, fix in typo_fixes.items():
+            cleaned = cleaned.replace(typo, fix)
+        
         # Global keywords (explicit intent to avoid filters)
         global_keywords = [
             "all data", "all the data", "across all", "global", "everything",
             "ignoring filter", "without filter", "entire", "whole dataset",
-            "regardless of filters", "all regions", "all categories",
-            "across the data", "acroos all", "acroos the data"  # Handling common typos
+            "regardless of filter", "all regions", "all categories",
+            "across the data", "across data",
+            "complete data", "the complete data", "on complete",
+            "full data", "full dataset", "total data", "overall",
+            "unfiltered", "no filter", "remove filter",
+            "whole data", "entire data", "entire dataset",
+            "option 2", "second option", "2",  # Numbered choice
         ]
         # Filtered keywords (explicit intent to use dashboard filters)
         filtered_keywords = [
             "current view", "this view", "filtered", "as shown",
             "with filter", "current", "what's shown", "in scope",
-            "this region", "selected only", "within view", "local"
+            "this region", "selected only", "within view", "local",
+            "as is", "what i see", "visible", "on screen",
+            "option 1", "first option", "1",  # Numbered choice
         ]
         
         # Check global first (more explicit)
         for kw in global_keywords:
-            if kw in answer_lower:
+            if kw in cleaned:
                 return "global"
         
         # Check filtered
         for kw in filtered_keywords:
-            if kw in answer_lower:
+            if kw in cleaned:
                 return "filtered"
         
         return None
