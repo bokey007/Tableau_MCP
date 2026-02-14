@@ -26,6 +26,7 @@ from datetime import datetime
 from operator import add
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -428,7 +429,7 @@ class DashboardAgent:
     # Node Implementations
     # =========================================================================
     
-    async def _classify_intent(self, state: DashboardAgentState) -> DashboardAgentState:
+    async def _classify_intent(self, state: DashboardAgentState, config: RunnableConfig = None) -> DashboardAgentState:
         """Classify user intent using heuristics + LLM fallback.
         
         Uses accumulated messages (the only reliably persistent field via the
@@ -438,12 +439,30 @@ class DashboardAgent:
         """
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
-        config = state.get("dashboard_config")
+        dashboard_config = state.get("dashboard_config")
         question_lower = question.lower().strip()
         
-        logger.info("Classifying intent", question=question[:50])
+        # Get thread_id for logging
+        thread_id = config.get("configurable", {}).get("thread_id", "unknown") if config else "unknown"
+        logger.info("Classifying intent", question=question[:50], thread_id=thread_id)
         
-        # Add user message to conversation history (appended via 'add' reducer)
+        # ── Follow-up scope answer detection (message-based) ──
+        # CRITICAL: Read history BEFORE we append the current message.
+        history = state.get("messages", [])
+        
+        # Detect follow-up using history
+        scope_followup = self._detect_scope_followup(history, question, question_lower)
+        
+        if scope_followup:
+            original_question, resolved_scope = scope_followup
+            logger.info("Scope follow-up detected via history",
+                       original_q=original_question[:50], scope=resolved_scope)
+            state["context_scope"] = resolved_scope
+            state["question"] = original_question
+            question = original_question
+            question_lower = question.lower().strip()
+        
+        # NOW append user message to conversation history (appended via 'add' reducer)
         state["messages"] = [HumanMessage(content=question)]
         
         # Clear previous turn results to prevent ghosting in memory
@@ -451,29 +470,17 @@ class DashboardAgent:
         state["visualization"] = None
         state["analysis"] = None
         state["error"] = None
-        state["context_scope"] = None
         
-        # ── Follow-up scope answer detection (message-based) ──
-        # Check the accumulated messages for a scope clarification from the
-        # previous turn. This is reliable because 'messages' uses the 'add'
-        # reducer and persists across LangGraph invocations.
-        messages = state.get("messages", [])
-        scope_followup = self._detect_scope_followup(messages, question, question_lower)
-        if scope_followup:
-            original_question, resolved_scope = scope_followup
-            logger.info("Scope follow-up detected via messages",
-                       original_q=original_question[:50], scope=resolved_scope)
-            state["context_scope"] = resolved_scope
-            state["question"] = original_question
-            question = original_question
-            question_lower = question.lower().strip()
+        # If we didn't just resolve scope from history, reset it
+        if not scope_followup:
+            state["context_scope"] = None
         
         # Heuristic classification (fast path)
         intent = self._classify_by_heuristics(question_lower)
         
         if intent is None:
             # LLM fallback for ambiguous cases
-            intent = await self._classify_by_llm(question, context, config)
+            intent = await self._classify_by_llm(question, context, dashboard_config)
         
         state["intent"] = intent
         state["needs_clarification"] = False
@@ -481,51 +488,44 @@ class DashboardAgent:
         return state
     
     def _detect_scope_followup(
-        self, messages: List[BaseMessage], current_question: str, current_lower: str
+        self, history: List[BaseMessage], current_question: str, current_lower: str
     ) -> Optional[tuple]:
         """Check if the current message is a follow-up to a scope clarification.
         
-        Scans accumulated messages for the pattern:
+        Scans history (BEFORE current message is added) for:
             HumanMessage (original question)
-            AIMessage    (scope clarification — contains 'Would you like results for')
-            HumanMessage (current scope answer)
+            AIMessage    (scope clarification)
         
         Returns (original_question, resolved_scope) or None.
         """
-        # Need at least 3 messages: original question + clarification + current answer
-        if len(messages) < 3:
+        if not history:
             return None
-        
-        # The last message is the current user input (just appended).
-        # The second-to-last should be the AI scope clarification.
-        # The third-to-last should be the original user question.
+            
+        # The history contains everything UP TO the current turn.
+        # We need to find the last HumanMessage and the last AIMessage after it.
         last_ai = None
-        original_human = None
+        last_human = None
         
-        # Walk backwards, skipping the current message (last one)
-        for msg in reversed(messages[:-1]):
+        for msg in reversed(history):
             if isinstance(msg, AIMessage) and last_ai is None:
                 last_ai = msg
             elif isinstance(msg, HumanMessage) and last_ai is not None:
-                original_human = msg
+                last_human = msg
                 break
         
-        if not last_ai or not original_human:
+        if not last_ai or not last_human:
             return None
         
-        # Check if the AI message was a scope clarification
+        # Verify it's a scope clarification
         scope_markers = ["Would you like results for", "Current view", "All data (global"]
         is_scope_clarification = any(marker in last_ai.content for marker in scope_markers)
         
         if not is_scope_clarification:
             return None
         
-        # Parse the current message as a scope answer
+        # Parse scope answer
         resolved_scope = self._parse_scope_answer(current_lower)
-        if not resolved_scope:
-            return None
-        
-        return (original_human.content, resolved_scope)
+        return (last_human.content, resolved_scope) if resolved_scope else None
     
     def _parse_scope_answer(self, answer_lower: str) -> Optional[str]:
         """Parse a follow-up message as a scope answer.
