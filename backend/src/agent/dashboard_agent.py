@@ -513,20 +513,26 @@ class DashboardAgent:
         if not history:
             return None
 
-            
-        # The history contains everything UP TO the current turn.
-        # We need to find the last HumanMessage and the last AIMessage after it.
+        # Only check the IMMEDIATE previous turn (last AI + Human pair)
+        # to avoid matching stale scope clarifications from many turns ago
         last_ai = None
         last_human = None
+        ai_index = None
         
-        for msg in reversed(history):
+        for i, msg in enumerate(reversed(history)):
             if isinstance(msg, AIMessage) and last_ai is None:
                 last_ai = msg
+                ai_index = i
             elif isinstance(msg, HumanMessage) and last_ai is not None:
                 last_human = msg
                 break
         
         if not last_ai or not last_human:
+            return None
+        
+        # Guard: scope clarification must be within the last 4 messages
+        # to avoid matching stale clarifications from many turns ago
+        if ai_index is not None and ai_index > 3:
             return None
         
         # Verify it's a scope clarification
@@ -879,6 +885,9 @@ RESOLVED_QUESTION: <the clean standalone question, or the original if not a foll
             state["analysis"] = "I couldn't process that action. Try: 'filter by Region = West' or 'clear all filters'."
             state["status"] = "complete"
         
+        # Add to conversation history so subsequent turns see the context change
+        state["messages"] = [AIMessage(content=f"[DASHBOARD_ACTION] {state.get('analysis', '')}")]
+        
         return state
     
     async def _handle_data_query(self, state: DashboardAgentState) -> DashboardAgentState:
@@ -1169,6 +1178,16 @@ Please create a compelling data story:
         # No filters = always global (logical shortcut)
         if not filters:
             return "global"
+        
+        # If the most recent AI message was a dashboard action, the context
+        # just changed — always ask about scope (don't carry forward old preference)
+        if history:
+            for msg in reversed(history):
+                if isinstance(msg, AIMessage):
+                    if msg.content.startswith("[DASHBOARD_ACTION]"):
+                        logger.info("Scope reset after dashboard action — returning ambiguous")
+                        return "ambiguous"
+                    break  # Only check the most recent AI message
         
         # Build conversation context for scope memory
         conv_context = ""
