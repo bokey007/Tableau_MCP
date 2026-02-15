@@ -1201,15 +1201,8 @@ Please create a compelling data story:
         if not filters:
             return "global"
         
-        # If the most recent AI message was a dashboard action, the context
-        # just changed — always ask about scope (don't carry forward old preference)
-        if history:
-            for msg in reversed(history):
-                if isinstance(msg, AIMessage):
-                    if msg.content.startswith("[DASHBOARD_ACTION]"):
-                        logger.info("Scope reset after dashboard action — returning ambiguous")
-                        return "ambiguous"
-                    break  # Only check the most recent AI message
+        # Recent dashboard action context is handled by LLM rules below
+        pass
         
         # Build conversation context for scope memory
         conv_context = ""
@@ -1242,9 +1235,10 @@ Determine the user's data scope intent. Respond with exactly one word:
 CRITICAL rules (follow in order):
 1. If the question contains explicit global signals ("all data", "complete data", "across all", "overall", "entire dataset", "globally", "whole data", "ignoring filters", "without filters"), return GLOBAL
 2. If the question contains explicit filtered signals ("this view", "here", "current view", "as filtered", "with these filters", "in this scope"), return FILTERED
-3. If conversation history shows the user previously chose a scope (look for "Data Scope: All data" or "Data Scope: Filtered" in AI responses), carry that preference forward — return the same scope
-4. If NONE of the above apply (generic question like "What is the sales trend?" with no scope words and no prior preference), return AMBIGUOUS
-5. When in doubt, return AMBIGUOUS — it is better to ask the user than to guess wrong
+3. If conversation history shows the most recent AI message was a dashboard action (marker: "[DASHBOARD_ACTION]"), this indicates the user just adjusted their view — for generic/ambiguous questions, return FILTERED
+4. If conversation history shows the user previously chose a scope (look for "Data Scope: All data" or "Data Scope: Filtered" in AI responses), carry that preference forward — return the same scope
+5. If NONE of the above apply (generic question with no scope words, no prior preference, and no recent action), return AMBIGUOUS
+6. When in doubt, return AMBIGUOUS — it is better to ask the user than to guess wrong
 
 Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
 
