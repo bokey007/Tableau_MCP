@@ -74,6 +74,11 @@ class DashboardAgentState(TypedDict, total=False):
     visualization: Optional[Dict[str, Any]]
     needs_clarification: bool
     
+    # Orchestration & Planning (Thinking Expert Analyst)
+    plan: Optional[List[Dict[str, Any]]] # List of steps [expert, question, reasoning]
+    step_results: Annotated[List[Dict[str, Any]], add] # Accumulate results from each expert
+    current_step_index: int # Pointer to the current task in the plan
+    
     # Metadata
     status: str
     error: Optional[str]
