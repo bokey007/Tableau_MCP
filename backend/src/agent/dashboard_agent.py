@@ -873,6 +873,28 @@ RESOLVED_QUESTION: <the clean standalone question, or the original if not a foll
             
             # Build response with action command for frontend
             state["analysis"] = action_data.get("message", "Action processed.")
+            
+            # Check if there was a pending scope clarification — if so,
+            # the user answered a scope question with a filter change (e.g.
+            # "What is the sales trend?" → scope ask → "for east region")
+            # In that case, include the original question for auto-requery
+            history = state.get("messages", [])
+            scope_markers = ["Would you like results for", "Current view", "All data (global"]
+            for msg in reversed(history):
+                if isinstance(msg, AIMessage):
+                    if any(marker in msg.content for marker in scope_markers):
+                        # Found a pending scope clarification — find the original question
+                        for msg2 in reversed(history):
+                            if isinstance(msg2, HumanMessage):
+                                original_q = msg2.content
+                                # Don't include the current question (which is the action)
+                                if original_q.lower().strip() != question.lower().strip():
+                                    action_data["auto_requery"] = original_q
+                                    logger.info("Pending scope clarification detected — will auto-requery",
+                                               original_q=original_q[:50])
+                                    break
+                    break  # Only check the most recent AI message
+            
             state["results"] = {
                 "dashboard_action": action_data
             }

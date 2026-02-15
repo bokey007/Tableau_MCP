@@ -243,14 +243,17 @@ function quickQuery(query) {
 /**
  * Send user message to the AI agent
  */
-async function sendMessage() {
+async function sendMessage(overrideMessage = null) {
     const input = document.getElementById('userInput');
-    const message = input.value.trim();
+    const message = overrideMessage || input.value.trim();
 
     if (!message) return;
 
-    // Clear input
-    input.value = '';
+    if (!overrideMessage) {
+        // Clear input only if it was a manual user message
+        input.value = '';
+    }
+
     messageCount++;
 
     // Add user message to chat
@@ -376,6 +379,14 @@ function handleStreamEvent(event, loadingId) {
                 executeDashboardAction(data.results.dashboard_action).then(actionResult => {
                     if (actionResult) {
                         addMessage('✅ Dashboard updated!', 'assistant');
+
+                        // Handle auto-requery if suggested by backend (e.g. after scope-change action)
+                        if (data.results.dashboard_action.auto_requery) {
+                            setTimeout(() => {
+                                log('Auto-requerying original question', { question: data.results.dashboard_action.auto_requery });
+                                sendMessage(data.results.dashboard_action.auto_requery);
+                            }, 1000);
+                        }
                     }
                 });
             }
@@ -485,6 +496,14 @@ async function sendMessageStandard(message) {
                 const actionResult = await executeDashboardAction(data.results.dashboard_action);
                 if (actionResult) {
                     addMessage('✅ Dashboard updated!', 'assistant');
+
+                    // Handle auto-requery if suggested by backend
+                    if (data.results.dashboard_action.auto_requery) {
+                        setTimeout(() => {
+                            log('Auto-requerying original question (standard)', { question: data.results.dashboard_action.auto_requery });
+                            sendMessage(data.results.dashboard_action.auto_requery);
+                        }, 1000);
+                    }
                 }
             }
 
@@ -564,8 +583,8 @@ function renderVisualization(vizConfig, data) {
 
     log('Chart axes mapped', { xAxis, yAxis, labelKey, valueKey });
 
-    // Use all data points for chart
-    const chartData = data;
+    // Extract labels and values (limit to 10)
+    const chartData = data.slice(0, 10);
     const labels = chartData.map(row => {
         const val = row[labelKey];
         return typeof val === 'string' && val.length > 25 ? val.substring(0, 22) + '...' : val;
@@ -699,7 +718,7 @@ function removeMessage(id) {
 /**
  * Add data preview table
  */
-function addDataPreview(data, maxRows = 100) {
+function addDataPreview(data, maxRows = 5) {
     if (!data || data.length === 0) return;
 
     const container = document.getElementById('chatContainer');
@@ -711,9 +730,9 @@ function addDataPreview(data, maxRows = 100) {
 
     let tableHtml = `
         <div class="message-content">
-            <div class="data-table" style="max-height: 300px; overflow-y: auto;">
+            <div class="data-table">
                 <table>
-                    <thead style="position: sticky; top: 0; z-index: 1;">
+                    <thead>
                         <tr>${columns.map(col => `<th>${col}</th>`).join('')}</tr>
                     </thead>
                     <tbody>
