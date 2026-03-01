@@ -360,56 +360,19 @@ async def stream_query(request: DashboardQueryRequest):
                 selected_marks=request.selected_marks,
             )
             
-            # Send thinking event
-            yield f"data: {json.dumps({'event': 'thinking', 'message': 'Analyzing your question...'})}\n\n"
-            await asyncio.sleep(0.1)  # Small delay for UX
+            # Send initial thinking event
+            yield f"data: {json.dumps({'event': 'thinking', 'message': 'Thinking Expert Analyst is planning...' })}\n\n"
             
-            # Get agent and process
-            agent = get_dashboard_agent()  # sync function, not async
+            # Get agent and process stream
+            agent = get_dashboard_agent()
             
-            # Send querying event
-            yield f"data: {json.dumps({'event': 'querying', 'message': 'Processing query...'})}\n\n"
-            
-            # Process the query
-            import time
-            start_time = time.time()
-            
-            result = await agent.process(
+            async for update in agent.process_stream(
                 question=request.question,
-                dashboard_context=context,  # Match method signature
-                thread_id=request.thread_id
-            )
-            
-            processing_time = (time.time() - start_time) * 1000
-            
-            # Send analyzing event if we have data
-            if result.get("results"):
-                yield f"data: {json.dumps({'event': 'analyzing', 'message': 'Analyzing results...'})}\n\n"
-                await asyncio.sleep(0.1)
-            
-            # Build final response
-            # Success if no error and we have analysis OR status is complete
-            is_success = (not result.get("error")) and (
-                result.get("status") == "complete" or 
-                result.get("analysis") is not None
-            )
-            response = {
-                "event": "complete",
-                "data": {
-                    "success": is_success,
-                    "intent": result.get("intent"),
-                    "query_type": result.get("query_type"),
-                    "context_scope": result.get("context_scope"),
-                    "analysis": result.get("analysis"),
-                    "results": result.get("results"),
-                    "visualization": result.get("visualization"),
-                    "error": result.get("error"),
-                    "processing_time_ms": processing_time,
-                    "thread_id": result.get("thread_id"),
-                }
-            }
-            
-            yield f"data: {json.dumps(response)}\n\n"
+                dashboard_context=context,
+                thread_id=request.thread_id,
+                username=request.username
+            ):
+                yield f"data: {json.dumps(update)}\n\n"
             
         except Exception as e:
             logger.exception("Streaming query failed", error=str(e))

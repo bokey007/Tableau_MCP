@@ -6,7 +6,7 @@
 // Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
 const CONFIG = {
     // Backend API URL (Cloudflare Tunnel for HTTPS)
-    API_URL: 'https://feeling-input-inspector-bundle.trycloudflare.com/api/v1',
+    API_URL: 'https://congratulations-memorial-barbie-beginners.trycloudflare.com/api/v1',
 
     // Request timeout in milliseconds
     TIMEOUT: 120000,
@@ -243,17 +243,14 @@ function quickQuery(query) {
 /**
  * Send user message to the AI agent
  */
-async function sendMessage(overrideMessage = null) {
+async function sendMessage() {
     const input = document.getElementById('userInput');
-    const message = overrideMessage || input.value.trim();
+    const message = input.value.trim();
 
     if (!message) return;
 
-    if (!overrideMessage) {
-        // Clear input only if it was a manual user message
-        input.value = '';
-    }
-
+    // Clear input
+    input.value = '';
     messageCount++;
 
     // Add user message to chat
@@ -298,7 +295,7 @@ async function sendMessageWithStreaming(message) {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'ngrok-skip-browser-warning': '69420'
+                'Bypass-Tunnel-Reminder': 'true'
             },
             body: JSON.stringify(requestBody)
         });
@@ -372,21 +369,44 @@ function handleStreamEvent(event, loadingId) {
                 : '';
 
             const analysisHtml = parseMarkdown(data.analysis || 'Query completed.');
-            addMessage(intentBadge + queryTypeBadge + actionBadge + analysisHtml, 'assistant');
+
+            // Build trust card HTML from structured trust metadata
+            let trustCardHtml = '';
+            if (data.trust && data.trust.confidence && data.trust.confidence.level !== 'unknown') {
+                const t = data.trust;
+                const conf = t.confidence;
+                const dsNames = (t.datasources_used || []).join(', ') || 'N/A';
+                const rows = t.total_rows_analyzed || 0;
+
+                trustCardHtml = `
+                    <div class="trust-card">
+                        <span class="trust-badge ${conf.level}">${conf.emoji} ${conf.level.charAt(0).toUpperCase() + conf.level.slice(1)} Confidence</span>
+                        <span class="trust-separator"></span>
+                        <span class="trust-source">📊 ${dsNames} • ${rows.toLocaleString()} rows</span>
+                        <span class="trust-separator"></span>
+                        <div class="feedback-actions">
+                            <button class="feedback-btn" onclick="submitFeedback(this, 'like')" title="Helpful">👍</button>
+                            <button class="feedback-btn" onclick="submitFeedback(this, 'dislike')" title="Not helpful">👎</button>
+                        </div>
+                    </div>`;
+            } else {
+                // Always show feedback buttons even without trust data
+                trustCardHtml = `
+                    <div class="trust-card" style="justify-content: flex-end;">
+                        <div class="feedback-actions">
+                            <button class="feedback-btn" onclick="submitFeedback(this, 'like')" title="Helpful">👍</button>
+                            <button class="feedback-btn" onclick="submitFeedback(this, 'dislike')" title="Not helpful">👎</button>
+                        </div>
+                    </div>`;
+            }
+
+            addMessage(intentBadge + queryTypeBadge + actionBadge + analysisHtml + trustCardHtml, 'assistant');
 
             // Execute dashboard action if present
             if (data.results && data.results.dashboard_action) {
                 executeDashboardAction(data.results.dashboard_action).then(actionResult => {
                     if (actionResult) {
                         addMessage('✅ Dashboard updated!', 'assistant');
-
-                        // Handle auto-requery if suggested by backend (e.g. after scope-change action)
-                        if (data.results.dashboard_action.auto_requery) {
-                            setTimeout(() => {
-                                log('Auto-requerying original question', { question: data.results.dashboard_action.auto_requery });
-                                sendMessage(data.results.dashboard_action.auto_requery);
-                            }, 1000);
-                        }
                     }
                 });
             }
@@ -404,6 +424,41 @@ function handleStreamEvent(event, loadingId) {
         } else {
             addMessage(`Error: ${data.error || 'Unknown error'}`, 'assistant');
         }
+    }
+}
+
+/**
+ * Submit feedback (like/dislike) for an AI response
+ */
+async function submitFeedback(btn, type) {
+    // Toggle visual state
+    const container = btn.closest('.feedback-actions');
+    const allBtns = container.querySelectorAll('.feedback-btn');
+    allBtns.forEach(b => b.classList.remove('active-like', 'active-dislike'));
+    btn.classList.add(type === 'like' ? 'active-like' : 'active-dislike');
+
+    try {
+        const response = await fetch(`${CONFIG.API_URL}/feedback`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Bypass-Tunnel-Reminder': 'true'
+            },
+            body: JSON.stringify({
+                feedback_type: type,
+                username: 'tableau-extension-user',
+                comment: null,
+                rating: type === 'like' ? 5 : 1,
+            })
+        });
+
+        if (response.ok) {
+            log('Feedback submitted', { type });
+        } else {
+            log('Feedback submission failed', { status: response.status });
+        }
+    } catch (err) {
+        log('Feedback error', err);
     }
 }
 
@@ -448,7 +503,7 @@ async function sendMessageStandard(message) {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'ngrok-skip-browser-warning': '69420' // Bypass ngrok warning page
+                'Bypass-Tunnel-Reminder': 'true'
             },
             body: JSON.stringify(requestBody)
         });
@@ -496,14 +551,6 @@ async function sendMessageStandard(message) {
                 const actionResult = await executeDashboardAction(data.results.dashboard_action);
                 if (actionResult) {
                     addMessage('✅ Dashboard updated!', 'assistant');
-
-                    // Handle auto-requery if suggested by backend
-                    if (data.results.dashboard_action.auto_requery) {
-                        setTimeout(() => {
-                            log('Auto-requerying original question (standard)', { question: data.results.dashboard_action.auto_requery });
-                            sendMessage(data.results.dashboard_action.auto_requery);
-                        }, 1000);
-                    }
                 }
             }
 
@@ -583,8 +630,8 @@ function renderVisualization(vizConfig, data) {
 
     log('Chart axes mapped', { xAxis, yAxis, labelKey, valueKey });
 
-    // Use all data points for chart
-    const chartData = data;
+    // Extract labels and values (limit to 10)
+    const chartData = data.slice(0, 10);
     const labels = chartData.map(row => {
         const val = row[labelKey];
         return typeof val === 'string' && val.length > 25 ? val.substring(0, 22) + '...' : val;
@@ -718,7 +765,7 @@ function removeMessage(id) {
 /**
  * Add data preview table
  */
-function addDataPreview(data, maxRows = 100) {
+function addDataPreview(data, maxRows = 5) {
     if (!data || data.length === 0) return;
 
     const container = document.getElementById('chatContainer');
@@ -730,9 +777,9 @@ function addDataPreview(data, maxRows = 100) {
 
     let tableHtml = `
         <div class="message-content">
-            <div class="data-table" style="max-height: 300px; overflow-y: auto;">
+            <div class="data-table">
                 <table>
-                    <thead style="position: sticky; top: 0; z-index: 1;">
+                    <thead>
                         <tr>${columns.map(col => `<th>${col}</th>`).join('')}</tr>
                     </thead>
                     <tbody>
@@ -974,10 +1021,11 @@ async function clearFilter(dashboard, actionData) {
 async function clearAllFilters(dashboard, actionData) {
     const worksheetName = actionData.worksheet;
 
-    // If no worksheet specified, try to clear on all worksheets
-    const worksheets = worksheetName
-        ? dashboard.worksheets.filter(ws => ws.name.toLowerCase().includes(worksheetName.toLowerCase()))
-        : dashboard.worksheets;
+    // If worksheet is "all" or not specified, clear on all worksheets
+    const isAll = !worksheetName || worksheetName.toLowerCase() === 'all';
+    const worksheets = isAll
+        ? dashboard.worksheets
+        : dashboard.worksheets.filter(ws => ws.name.toLowerCase().includes(worksheetName.toLowerCase()));
 
     for (const worksheet of worksheets) {
         try {

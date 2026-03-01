@@ -284,3 +284,91 @@ body {
   color: var(--text-secondary);
   margin-bottom: 8px;
 }
+
+/* Trust Card */
+.trust-card {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: rgba(74, 144, 217, 0.08);
+  border: 1px solid rgba(74, 144, 217, 0.2);
+  border-radius: 10px;
+  font-size: 11px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.trust-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.trust-badge.high {
+  background: rgba(72, 187, 120, 0.15);
+  color: #48bb78;
+  border: 1px solid rgba(72, 187, 120, 0.3);
+}
+
+.trust-badge.medium {
+  background: rgba(237, 184, 56, 0.15);
+  color: #edb838;
+  border: 1px solid rgba(237, 184, 56, 0.3);
+}
+
+.trust-badge.low {
+  background: rgba(252, 129, 129, 0.15);
+  color: #fc8181;
+  border: 1px solid rgba(252, 129, 129, 0.3);
+}
+
+.trust-source {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.trust-separator {
+  width: 1px;
+  height: 14px;
+  background: var(--border-color);
+}
+
+/* Feedback Buttons */
+.feedback-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.feedback-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  transition: all 0.2s;
+}
+
+.feedback-btn:hover {
+  background: var(--surface-light);
+  border-color: var(--primary-color);
+}
+
+.feedback-btn.active-like {
+  background: rgba(72, 187, 120, 0.15);
+  border-color: #48bb78;
+  color: #48bb78;
+}
+
+.feedback-btn.active-dislike {
+  background: rgba(252, 129, 129, 0.15);
+  border-color: #fc8181;
+  color: #fc8181;
+}

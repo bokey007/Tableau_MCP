@@ -1,27 +1,31 @@
-# =============================================================================
-# Dashboard Agent - LangGraph-Based Master Orchestrator
-# =============================================================================
 """
 Dashboard Agent using LangGraph for the Tableau Extension.
-Leverages LangGraph's StateGraph for routing and MemorySaver for conversation memory.
+Leverages LangGraph's StateGraph for a Plan-and-Execute workflow.
 
 Architecture:
-    User Question → classify_intent → route_by_intent
-                                         │
-              ┌──────────┬───────────────┼───────────────┬──────────────┐
-              ▼          ▼               ▼               ▼              ▼
-           [chat]  [capability]  [dashboard_context] [clarify]    [data_query]
-              │          │               │               │              │
-              └──────────┴───────────────┴───────────────┴──────────────┘
-                                         │
-                                         ▼
-                                       [END]
+    User Question → orchestrate (Planner)
+                      │
+                      ▼
+               ┌─── replan (Adaptive) ───┐
+               │         │               │
+               ▼         ▼               ▼
+           [Expert 1] [Expert 2] ... [Expert N]
+               │         │               │
+               └─────────┴───────┬───────┘
+                                 │
+                                 ▼
+                             synthesize (Final Story)
+                                 │
+                                 ▼
+                               [END]
 """
 
+import json
 import re
 import uuid
 import asyncio
-from typing import Any, Dict, List, Optional, Annotated, TypedDict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from typing import Any, AsyncIterator, Dict, List, Optional, Annotated, TypedDict
 from datetime import datetime
 from operator import add
 
@@ -30,18 +34,46 @@ from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 
 from src.core.config import settings
 from src.core.logging import get_logger
 from src.agent.graph import TableauAgent  # Import existing Data Agent
 from src.services.config_service import get_config_service, DashboardConfig
+from src.agent.trust_layer import (
+    build_citation_from_result, format_citation, format_citations,
+    validate_data_response, compute_confidence, SourceCitation,
+)
+from src.agent.data_dictionary import get_data_dictionary
 
 logger = get_logger(__name__)
 
 
 # =============================================================================
-# State Definition (LangGraph Native)
+# Custom Reducers for Plan-Execution State
 # =============================================================================
+
+def reduce_step_results(existing: List, new: List) -> List:
+    """
+    Custom reducer for step_results:
+    - If new value is an empty list [], RESET (start of a new query)
+    - Otherwise APPEND (accumulate within a query's execution)
+    """
+    if not new:  # Orchestrator sends [] to signal new query
+        return []
+    return (existing or []) + new
+
+
+def reduce_step_index(existing: int, new: int) -> int:
+    """
+    Custom reducer for current_step_index:
+    - If new value is -1, RESET to 0 (start of a new query)
+    - Otherwise ADD (accumulate within a query's execution)
+    """
+    if new == -1:  # Orchestrator sends -1 to signal reset
+        return 0
+    return (existing or 0) + new
+
 
 class DashboardContext(TypedDict, total=False):
     """Context captured from Tableau dashboard."""
@@ -60,6 +92,7 @@ class DashboardAgentState(TypedDict, total=False):
     username: str
     dashboard_context: DashboardContext
     dashboard_config: Optional[Dict[str, Any]]  # Config enrichment from YAML
+    pending_question: Optional[str] # To track original question during scope clarification
     
     # Processing
     intent: str  # chat, capability, dashboard_context, clarification, data_query, comparison, anomaly, storytelling
@@ -75,9 +108,10 @@ class DashboardAgentState(TypedDict, total=False):
     needs_clarification: bool
     
     # Orchestration & Planning (Thinking Expert Analyst)
-    plan: Optional[List[Dict[str, Any]]] # List of steps [expert, question, reasoning]
-    step_results: Annotated[List[Dict[str, Any]], add] # Accumulate results from each expert
-    current_step_index: int # Pointer to the current task in the plan
+    plan: Optional[List[Dict[str, Any]]] # List of steps [{"expert": "node", "question": "..."}]
+    step_results: Annotated[List[Dict[str, Any]], reduce_step_results] # Smart reset+accumulate
+    current_step_index: Annotated[int, reduce_step_index] # Smart reset+accumulate
+    pending_observations: List[str] # Insights generated during execution to inform the re-planner
     
     # Metadata
     status: str
@@ -89,47 +123,104 @@ class DashboardAgentState(TypedDict, total=False):
 # Prompts
 # =============================================================================
 
-INTENT_CLASSIFIER_PROMPT = """Classify the user's intent. Respond with exactly ONE word from:
-- chat (greetings, thanks, casual conversation)
-- capability (asking what you can do, help)
-- dashboard_context (asking about current filters, selections, what's shown, what datasources are used, what worksheets exist)
-- dashboard_action (requests to CHANGE the dashboard: "filter by", "filter dashboard by", "show only", "set parameter", "clear filters", "go to sheet". Also includes context-switching: "shift focus to X", "let's look at X", "zoom into X", "narrow down to X", "switch to X", "focus on X", "move to X". ANY request that implies changing what the dashboard displays is dashboard_action, even if phrased conversationally. IMPORTANT: if the user says "filter" + a value/region/category, this is ALWAYS dashboard_action)
-- clarification (vague question needing more detail: single words like "sales", "profit")
-- comparison (comparing time periods, regions, categories: "Q1 vs Q2", "compare East and West", "year over year")
-- anomaly (unusual patterns, outliers: "what's unusual", "anomalies", "outliers", "unexpected")
-- storytelling (narrative summary, presentation: "summarize", "tell me the story", "executive summary")
-- data_query (standard data analysis: "top 5 customers", "total sales by region". NOT for filter/action requests)
+ORCHESTRATOR_SYSTEM = """You are the Lead Expert Analyst for a Tableau Dashboard. Your ONLY job is to PLAN which expert(s) should handle the user's question.
+
+Available Experts (use EXACTLY these names):
+- chat: ONLY for greetings, thanks, casual conversation ("hi", "thanks", "bye")
+- capability: ONLY for "what can you do?" or "help" questions
+- dashboard_context: ONLY for questions about the CURRENT STATE of the dashboard UI ("what filters are active?", "what worksheets exist?", "what datasources are connected?")
+- dashboard_action: ONLY for requests to CHANGE the dashboard ("filter by X", "clear filters", "navigate to sheet Y")
+- clarification: ONLY when the question is a single vague word like "sales" or "profit" with no verb
+- data_query: For ANY question requiring DATA RETRIEVAL from Tableau ("total sales by region", "top 5 customers", "what is the profit?", "show me revenue trends")
+- comparison: For comparing two or more things using data ("compare East vs West", "Q1 vs Q2")
+- anomaly: For finding outliers or unusual patterns in data ("any anomalies?", "what's unusual?")
+- storytelling: For narrative summaries requiring data ("summarize this dashboard", "executive summary")
+
+CRITICAL RULES:
+1. `data_query` is the DEFAULT for any analytical question. If it asks about numbers, totals, trends, rankings, or anything that needs actual data — use `data_query`.
+2. `dashboard_context` is ONLY for UI state questions (filters, worksheets, datasources). NEVER use it for data analysis.
+3. `comparison`, `anomaly`, and `storytelling` ALL require fetching real data from Tableau — they are specialized data queries.
+4. For multi-part requests (e.g., "Filter to East and check anomalies"), create multiple steps.
+5. If the user answered a previous scope clarification with a filter (e.g., "for West region"), plan: [dashboard_action, data_query].
+
+EXAMPLES:
+- "Hello" → {{"plan": [{{"expert": "chat", "question": "Hello", "reasoning": "Greeting"}}]}}  
+- "What can you do?" → {{"plan": [{{"expert": "capability", "question": "What can you do?", "reasoning": "Asking about capabilities"}}]}}
+- "What filters are active?" → {{"plan": [{{"expert": "dashboard_context", "question": "What filters are active?", "reasoning": "Asking about current dashboard state"}}]}}
+- "Total sales by region" → {{"plan": [{{"expert": "data_query", "question": "Total sales by region", "reasoning": "Needs data from Tableau"}}]}}
+- "Top 5 customers by profit" → {{"plan": [{{"expert": "data_query", "question": "Top 5 customers by profit", "reasoning": "Ranking query needs data"}}]}}
+- "Compare East vs West sales" → {{"plan": [{{"expert": "comparison", "question": "Compare East vs West sales", "reasoning": "Comparison of two regions"}}]}}
+- "Any anomalies in profit?" → {{"plan": [{{"expert": "anomaly", "question": "Any anomalies in profit?", "reasoning": "Looking for outliers"}}]}}
+- "Filter to West and show top products" → {{"plan": [{{"expert": "dashboard_action", "question": "Filter to West region", "reasoning": "Apply filter first"}}, {{"expert": "data_query", "question": "Top products", "reasoning": "Then query data"}}]}}
+
+Context:
+Dashboard: {dashboard_name}
+Active Filters: {filters}
+Worksheets: {worksheets}
+Conversation History: {history}
+
+Question: "{question}"
+
+Respond with ONLY a JSON object:
+{{"plan": [{{"expert": "expert_name", "question": "question for this expert", "reasoning": "why"}}]}}"""
+
+
+SYNTHESIS_SYSTEM = """You are a senior data analyst synthesizing results from multiple queries.
 
 Question: {question}
-Dashboard Context: {context}
+Results: {results}
 
-Intent:"""
+RULES:
+1. Lead with the direct answer — numbers first, narrative second.
+2. Cite exact values from the results. NEVER invent numbers.
+3. Use markdown tables for comparisons. Use bold for key figures.
+4. Be concise: max 3-4 paragraphs. No filler or boilerplate.
+5. If results contain errors or empty data, say so plainly.
+6. End with exactly 2-3 actionable follow-up suggestions prefixed with 💡.
 
+Format:
+[Direct answer with key numbers]
+[Supporting analysis — 2-3 paragraphs max]
 
-CHAT_RESPONSE_SYSTEM = """You are a friendly AI analytics assistant embedded in a Tableau dashboard. 
-Keep responses brief (1-2 sentences). Be warm and helpful."""
-
-
-CAPABILITY_RESPONSE_SYSTEM = """You are an AI analytics assistant in a Tableau dashboard. Explain your capabilities briefly.
-Available datasources: {datasources}
-Current dashboard: {dashboard_name}
-
-You can:
-- Answer data questions in natural language
-- Analyze trends, aggregations, comparisons
-- Explain current filters and selections
-- Help understand the dashboard
-
-Keep response to 3-4 sentences."""
+💡 **Next steps:**
+- [Specific data-driven follow-up]
+- [Related metric to investigate]"""
 
 
-CONTEXT_RESPONSE_SYSTEM = """You are an AI assistant explaining the current dashboard state.
-Dashboard: {dashboard_name}
+CHAT_RESPONSE_SYSTEM = """You are an AI data analyst in a Tableau dashboard.
+Respond in 1-2 sentences max. Be direct and professional. No essays."""
+
+
+CAPABILITY_RESPONSE_SYSTEM = """You are an AI data analyst in the "{dashboard_name}" dashboard.
+Datasources: {datasources}
+
+Respond with a SHORT bullet list (max 6 bullets). No paragraphs, no elaboration.
+Capabilities:
+- Answer data questions (top N, totals, trends)
+- Compare regions, periods, categories
+- Detect anomalies and outliers
+- Apply filters and navigate the dashboard
+- Generate executive summaries
+
+Limit response to the bullet list only."""
+
+
+CONTEXT_RESPONSE_SYSTEM = """You are an AI assistant reporting the current state of the Tableau dashboard.
+
+Dashboard Name: {dashboard_name}
 Active Filters: {filters}
 Worksheets: {worksheets}
 Datasources: {datasources}
 
-Answer the user's question about what's currently shown/selected, including datasource names if asked."""
+RESPOND WITH A CONCISE BULLET LIST. Do NOT write essays or narratives.
+Format:
+- **Dashboard:** name
+- **Active Filters:** list each filter as Field = Value
+- **Worksheets:** list names
+- **Datasources:** list names
+
+If a filter value is "Null - Null" or empty, say "No date filter applied" instead.
+Only include sections the user asked about. Be brief."""
 
 
 CLARIFICATION_SYSTEM = """The user's question is too vague. Ask for clarification with 2-3 specific suggestions.
@@ -175,8 +266,6 @@ Supported actions:
 
 5. navigate - Navigate to a different worksheet/sheet
    {{"action": "navigate", "worksheet": "Sheet Name", "message": "Navigating..."}}
-
-User request: {question}
 
 Respond with ONLY a valid JSON object. Include a "message" field with a friendly confirmation message.
 If the request is unclear, respond with:
@@ -314,11 +403,22 @@ class DashboardAgent:
         logger.info("Dashboard Agent (LangGraph) initialized")
     
     @classmethod
-    def get_checkpointer(cls) -> MemorySaver:
-        """Get or create shared checkpointer for conversation memory."""
+    def get_checkpointer(cls):
+        """Get or create shared checkpointer for persistent conversation memory.
+        
+        Uses PostgreSQL for persistence (survives container restarts).
+        Falls back to MemorySaver if Postgres is unavailable.
+        """
         if cls._checkpointer is None:
-            cls._checkpointer = MemorySaver()
-            logger.info("Initialized Dashboard Agent MemorySaver")
+            try:
+                from src.core.config import settings
+                db_url = settings.sync_database_url
+                cls._checkpointer = PostgresSaver.from_conn_string(db_url)
+                cls._checkpointer.setup()  # Create tables if they don't exist
+                logger.info("Initialized PostgreSQL-backed checkpointer for persistent memory")
+            except Exception as e:
+                logger.warning(f"PostgreSQL checkpointer failed, falling back to MemorySaver: {e}")
+                cls._checkpointer = MemorySaver()
         return cls._checkpointer
     
     @property
@@ -365,8 +465,12 @@ class DashboardAgent:
         """Build the LangGraph workflow for Dashboard Agent."""
         graph = StateGraph(DashboardAgentState)
         
-        # Add nodes
-        graph.add_node("classify_intent", self._classify_intent)
+        # Add core orchestration nodes
+        graph.add_node("orchestrate", self._orchestrate)
+        graph.add_node("replan", self._replan)
+        graph.add_node("synthesize", self._synthesize)
+        
+        # Add expert nodes (workers)
         graph.add_node("handle_chat", self._handle_chat)
         graph.add_node("handle_capability", self._handle_capability)
         graph.add_node("handle_context", self._handle_context)
@@ -378,12 +482,12 @@ class DashboardAgent:
         graph.add_node("handle_storytelling", self._handle_storytelling)
         
         # Entry point
-        graph.set_entry_point("classify_intent")
+        graph.set_entry_point("orchestrate")
         
-        # Conditional routing based on intent
+        # Routing from orchestrator (starts the loop)
         graph.add_conditional_edges(
-            "classify_intent",
-            self._route_by_intent,
+            "orchestrate",
+            self._get_next_step,
             {
                 "chat": "handle_chat",
                 "capability": "handle_capability",
@@ -394,33 +498,64 @@ class DashboardAgent:
                 "comparison": "handle_comparison",
                 "anomaly": "handle_anomaly",
                 "storytelling": "handle_storytelling",
+                "complete": "synthesize"
+            }
+        )
+
+        # Expert nodes always go to replan
+        graph.add_edge("handle_chat", "replan")
+        graph.add_edge("handle_capability", "replan")
+        graph.add_edge("handle_context", "replan")
+        graph.add_edge("handle_clarification", "replan")
+        graph.add_edge("handle_dashboard_action", "replan")
+        graph.add_edge("handle_data_query", "replan")
+        graph.add_edge("handle_comparison", "replan")
+        graph.add_edge("handle_anomaly", "replan")
+        graph.add_edge("handle_storytelling", "replan")
+
+        # Replanner goes back to dispatcher
+        graph.add_conditional_edges(
+            "replan",
+            self._get_next_step,
+            {
+                "chat": "handle_chat",
+                "capability": "handle_capability",
+                "dashboard_context": "handle_context",
+                "clarification": "handle_clarification",
+                "dashboard_action": "handle_dashboard_action",
+                "data_query": "handle_data_query",
+                "comparison": "handle_comparison",
+                "anomaly": "handle_anomaly",
+                "storytelling": "handle_storytelling",
+                "complete": "synthesize"
             }
         )
         
-        # All handlers go to END
-        graph.add_edge("handle_chat", END)
-        graph.add_edge("handle_capability", END)
-        graph.add_edge("handle_context", END)
-        graph.add_edge("handle_clarification", END)
-        graph.add_edge("handle_dashboard_action", END)
-        graph.add_edge("handle_data_query", END)
-        graph.add_edge("handle_comparison", END)
-        graph.add_edge("handle_anomaly", END)
-        graph.add_edge("handle_storytelling", END)
+        # Final synthesis ends the graph
+        graph.add_edge("synthesize", END)
         
         return graph
-    
-    def _route_by_intent(self, state: DashboardAgentState) -> str:
-        """Route to appropriate handler based on classified intent."""
-        intent = state.get("intent", "data_query")
+
+    def _get_next_step(self, state: DashboardAgentState) -> str:
+        """Conditional edge that determines the next expert to invoke or if it's time to synthesize."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
         
-        # Map intent to node name
-        intent_map = {
+        if not plan or idx >= len(plan):
+            logger.info("Plan complete or empty, routing to synthesis")
+            return "complete"
+            
+        next_task = plan[idx]
+        expert = next_task.get("expert")
+        
+        logger.info(f"Routing to next expert: {expert}", step=idx + 1, total=len(plan))
+        
+        # Map expert names to edge keys
+        expert_map = {
             "chat": "chat",
             "capability": "capability",
             "dashboard_context": "dashboard_context",
             "dashboard_action": "dashboard_action",
-            "clarification_needed": "clarification",
             "clarification": "clarification",
             "data_query": "data_query",
             "comparison": "comparison",
@@ -428,386 +563,378 @@ class DashboardAgent:
             "storytelling": "storytelling",
         }
         
-        return intent_map.get(intent, "data_query")
+        return expert_map.get(expert, "complete")
     
     # =========================================================================
     # Node Implementations
     # =========================================================================
     
-    async def _classify_intent(self, state: DashboardAgentState, config: RunnableConfig = None) -> DashboardAgentState:
-        """Classify user intent using heuristics + LLM fallback.
-        
-        Uses accumulated messages (the only reliably persistent field via the
-        'add' reducer) to detect scope follow-ups. If the previous AI response
-        was a scope clarification question, the current user message is treated
-        as a scope answer and the original query is re-executed.
-        """
+    async def _orchestrate(self, state: DashboardAgentState, config: RunnableConfig = None) -> DashboardAgentState:
+        """The Planning node: Analyzes intent and context to build a multi-step plan."""
         question = state.get("question", "")
         context = state.get("dashboard_context", {})
-        dashboard_config = state.get("dashboard_config")
-        question_lower = question.lower().strip()
-        
-        # Get thread_id for logging
-        thread_id = config.get("configurable", {}).get("thread_id", "unknown") if config else "unknown"
-        logger.info("Classifying intent", question=question[:50], thread_id=thread_id)
-        
-        # ── Conversational follow-up resolution (message-based) ──
-        # CRITICAL: Read history BEFORE we append the current message.
         history = state.get("messages", [])
         
-        # 1) Check if this is a scope-clarification answer (narrow check)
-        scope_followup = await self._detect_scope_followup(history, question, question_lower)
-        
-        if scope_followup:
-            original_question, resolved_scope = scope_followup
-            logger.info("Scope follow-up detected via history",
-                       original_q=original_question[:50], scope=resolved_scope)
-            state["context_scope"] = resolved_scope
-            state["question"] = original_question
-            question = original_question
-            question_lower = question.lower().strip()
-        else:
-            # 2) Check if this is a broader conversational follow-up
-            #    e.g. "and for tech category?" after a sales trend result
-            resolved_q, prev_scope = await self._resolve_conversational_followup(
-                history, question
-            )
-            if resolved_q != question:
-                logger.info("Conversational follow-up resolved",
-                           original=question[:40], resolved=resolved_q[:60],
-                           carried_scope=prev_scope)
-                state["question"] = resolved_q
-                question = resolved_q
-                question_lower = question.lower().strip()
-                # Carry forward the scope from the previous exchange
-                if prev_scope:
-                    state["context_scope"] = prev_scope
-        
-        # NOW append user message to conversation history (appended via 'add' reducer)
-        state["messages"] = [HumanMessage(content=question)]
-        
-        # Clear previous turn results to prevent ghosting in memory
-        state["results"] = None
-        state["visualization"] = None
-        state["analysis"] = None
-        state["error"] = None
-        
-        # If we didn't resolve scope from follow-up, reset it
-        if not scope_followup and state.get("context_scope") is None:
-            state["context_scope"] = None
-        
-        # LLM-powered intent classification (no heuristic fast-path)
-        intent = await self._classify_by_llm(question, context, dashboard_config)
-        
-        state["intent"] = intent
-        state["needs_clarification"] = False
-        logger.info("Intent classified", intent=intent)
-        return state
-    
-    async def _detect_scope_followup(
-        self, history: List[BaseMessage], current_question: str, current_lower: str
-    ) -> Optional[tuple]:
-        """Check if the current message is a follow-up to a scope clarification.
-        
-        Scans history (BEFORE current message is added) for:
-            HumanMessage (original question)
-            AIMessage    (scope clarification)
-        
-        Returns (original_question, resolved_scope) or None.
-        """
-        if not history:
-            return None
-
-        # Only check the IMMEDIATE previous turn (last AI + Human pair)
-        # to avoid matching stale scope clarifications from many turns ago
-        last_ai = None
-        last_human = None
-        ai_index = None
-        
-        for i, msg in enumerate(reversed(history)):
-            if isinstance(msg, AIMessage) and last_ai is None:
-                last_ai = msg
-                ai_index = i
-            elif isinstance(msg, HumanMessage) and last_ai is not None:
-                last_human = msg
-                break
-        
-        if not last_ai or not last_human:
-            return None
-        
-        # Guard: scope clarification must be within the last 4 messages
-        # to avoid matching stale clarifications from many turns ago
-        if ai_index is not None and ai_index > 3:
-            return None
-        
-        # Verify it's a scope clarification
-        scope_markers = ["Would you like results for", "Current view", "All data (global"]
-        is_scope_clarification = any(marker in last_ai.content for marker in scope_markers)
-        
-        if not is_scope_clarification:
-            return None
-        
-        # Use LLM to parse scope answer
-        resolved_scope = await self._parse_scope_answer(current_lower, last_ai.content)
-        return (last_human.content, resolved_scope) if resolved_scope else None
-    
-    async def _parse_scope_answer(self, user_reply: str, ai_clarification: str) -> Optional[str]:
-        """Use LLM to interpret a user's reply to a scope clarification question.
-        
-        Returns 'global', 'filtered', or None if the reply is unrelated.
-        """
-        try:
-            prompt = f"""You are interpreting a user's reply to a data scope question.
-
-The AI previously asked:
-\"\"\"{ai_clarification}\"\"\"
-
-The user replied:
-\"\"\"{user_reply}\"\"\"
-
-Classify the user's intent. Respond with exactly ONE word:
-- global  (user wants ALL data, ignoring dashboard filters — e.g. "all data", "everything", "complete data", "across all", "the whole thing", "option 2", "second one")
-- filtered  (user wants the CURRENT VIEW with active filters — e.g. "current view", "as shown", "this view", "with the filter", "option 1", "first one", "yes the filtered one")
-- unknown  (the reply is unrelated to scope — this includes dashboard commands like changing filters, switching focus to a region/category, navigating, or any request that implies modifying the dashboard rather than answering the scope question)
-
-Intent:"""
-            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            result = response.content.strip().lower()
+        # Build history string for LLM
+        history_str = ""
+        if history:
+            recent = history[-6:]
+            history_str = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:200]}" for m in recent])
             
-            if result in ("global", "filtered"):
-                logger.info("LLM scope answer parsed", reply=user_reply[:40], scope=result)
-                return result
-            
-            logger.info("LLM scope answer: unknown/unrelated", reply=user_reply[:40], result=result)
-            return None
-            
-        except Exception as e:
-            logger.warning("LLM scope parsing failed, falling back", error=str(e))
-            return None
-
-    async def _resolve_conversational_followup(
-        self, history: List[BaseMessage], current_question: str
-    ) -> tuple:
-        """Use LLM to detect conversational follow-ups and resolve them.
+        logger.info("Orchestrating analysis", question=question[:50])
         
-        Detects when the current message is a continuation of a previous exchange
-        (e.g. "and for tech category?" after a sales trend answer) and rewrites
-        it into a complete standalone question.
+        # --- Phase 2: Enrich orchestrator with domain knowledge ---
+        enrichment_parts = []
         
-        Scope is extracted deterministically from the AI's "Data Scope:" indicator
-        in the previous response — NOT from the LLM's interpretation.
+        # (a) Data Dictionary context
+        data_dict = get_data_dictionary()
+        if data_dict and not data_dict.is_empty():
+            dd_context = data_dict.to_prompt_context()
+            if dd_context:
+                enrichment_parts.append(dd_context)
+                logger.info("Data dictionary injected into orchestrator", field_count=len(data_dict._fields))
         
-        Returns:
-            (resolved_question, previous_scope) — resolved_question equals
-            current_question if no follow-up was detected; previous_scope is
-            'global', 'filtered', or None.
-        """
-        if not history or len(history) < 2:
-            return (current_question, None)
+        # (b) Dashboard config (KPIs, glossary, ai_instructions)
+        dashboard_name = context.get("dashboard_name", "")
+        if dashboard_name:
+            config_service = get_config_service()
+            dash_config = config_service.get_config(dashboard_name)
+            if dash_config:
+                config_context = self._build_config_context({
+                    "kpis": [{"name": k.name, "field": k.field, "description": k.description, "target": k.target} for k in dash_config.kpis],
+                    "glossary": dash_config.glossary,
+                    "ai_instructions": dash_config.ai_instructions,
+                })
+                if config_context:
+                    enrichment_parts.append(config_context)
+                    logger.info("Dashboard config injected into orchestrator", dashboard=dashboard_name)
         
-        # ── Deterministic scope extraction from previous AI response ──
-        # Look for our own "Data Scope:" indicator in the last AI message
-        prev_scope = None
-        for msg in reversed(history):
-            if isinstance(msg, AIMessage):
-                content = msg.content
-                if "Data Scope: All data" in content or "Data Scope: All Data" in content:
-                    prev_scope = "global"
-                elif "Data Scope: Filtered" in content:
-                    prev_scope = "filtered"
-                break  # Only check the most recent AI message
+        enrichment_str = ""
+        if enrichment_parts:
+            enrichment_str = "\n\n--- Domain Knowledge ---\n" + "\n\n".join(enrichment_parts)
         
-        # Build recent conversation context (last 6 messages max)
-        recent = history[-6:]
-        conv_lines = []
-        for msg in recent:
-            role = "User" if isinstance(msg, HumanMessage) else "AI"
-            conv_lines.append(f"{role}: {msg.content[:300]}")
-        conversation_context = "\n".join(conv_lines)
-        
-        try:
-            prompt = f"""You are an expert data analyst assistant. Determine if the user's latest message is a follow-up to the previous conversation.
-
-Recent conversation:
-{conversation_context}
-
-User's latest message: "{current_question}"
-
-Rules:
-1. If the user is requesting a CHANGE to the dashboard (e.g. changing filters, switching to a different region/category, navigating, clearing filters, or any command that implies modifying what the dashboard displays), this is NOT a follow-up. Return IS_FOLLOWUP: no and keep the original message.
-2. If this IS a data follow-up (refining, extending, or asking for a variation of a previous analytical query), rewrite it as a COMPLETE standalone analytical question.
-3. CRITICAL: Do NOT include any region, filter, or dashboard context in the resolved question. Write a PURE analytical question.
-   - WRONG: "What is the sales trend for Technology in Region=West?"
-   - RIGHT: "What is the sales trend for the Technology category?"
-4. The data scope (global vs filtered) is managed separately — do not mention it in the question.
-
-Respond in EXACTLY this format (2 lines, no extra text):
-IS_FOLLOWUP: yes/no
-RESOLVED_QUESTION: <the clean standalone question, or the original if not a follow-up>"""
-
-            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            lines = response.content.strip().split("\n")
-            
-            is_followup = False
-            resolved = current_question
-            
-            for line in lines:
-                line = line.strip()
-                if line.lower().startswith("is_followup:"):
-                    is_followup = "yes" in line.lower()
-                elif line.lower().startswith("resolved_question:"):
-                    resolved = line.split(":", 1)[1].strip().strip('"')
-            
-            if is_followup and resolved and resolved != current_question:
-                logger.info("Follow-up resolved by LLM",
-                           original=current_question[:40],
-                           resolved=resolved[:60],
-                           deterministic_scope=prev_scope)
-                return (resolved, prev_scope)
-            
-            return (current_question, prev_scope)
-            
-        except Exception as e:
-            logger.warning("Follow-up resolution failed", error=str(e))
-            return (current_question, prev_scope)
-
-
-    
-    async def _classify_by_llm(self, question: str, context: DashboardContext, config: Optional[Dict] = None) -> str:
-        """Use LLM for ambiguous intent classification."""
-        try:
-            context_str = self._format_context_summary(context, config)
-            prompt = INTENT_CLASSIFIER_PROMPT.format(
-                question=question,
-                context=context_str
-            )
-            
-            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            intent = response.content.strip().lower()
-            
-            valid_intents = [
-                "chat", "capability", "dashboard_context", "dashboard_action",
-                "clarification", "data_query", "comparison", "anomaly", "storytelling"
-            ]
-            if intent in valid_intents:
-                return intent
-            
-            return "data_query"  # Default
-            
-        except Exception as e:
-            logger.warning("LLM classification failed", error=str(e))
-            return "data_query"
-    
-    async def _handle_chat(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Handle casual conversation with multi-turn memory."""
-        question = state.get("question", "")
-        
-        try:
-            # Build messages including conversation history
-            messages = [SystemMessage(content=CHAT_RESPONSE_SYSTEM)]
-            
-            # Add conversation history from state (maintained by LangGraph checkpointer)
-            history = state.get("messages", [])
-            if history:
-                # Include last 10 messages for context (5 turns)
-                messages.extend(history[-10:])
-            
-            # Add current user message
-            messages.append(HumanMessage(content=question))
-            
-            response = await self.llm.ainvoke(messages)
-            
-            state["analysis"] = response.content
-            state["status"] = "complete"
-            # Add both user message and response to conversation history
-            state["messages"] = [
-                HumanMessage(content=question),
-                AIMessage(content=response.content)
-            ]
-            
-        except Exception as e:
-            logger.error("Chat handler error", error=str(e))
-            state["analysis"] = "Hello! I'm here to help you analyze your dashboard data. What would you like to know?"
-            state["status"] = "complete"
-        
-        return state
-    
-    async def _handle_capability(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Explain agent capabilities."""
-        question = state.get("question", "")
-        context = state.get("dashboard_context", {})
-        
-        dashboard_name = context.get("dashboard_name", "your dashboard")
-        datasources = [ds.get("name", "data") for ds in context.get("datasources", [])]
-        
-        try:
-            system_prompt = CAPABILITY_RESPONSE_SYSTEM.format(
-                dashboard_name=dashboard_name,
-                datasources=", ".join(datasources) if datasources else "connected datasources"
-            )
-            
-            response = await self.llm.ainvoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=question)
-            ])
-            
-            state["analysis"] = response.content
-            state["status"] = "complete"
-            
-        except Exception as e:
-            state["analysis"] = f"I can help analyze data in {dashboard_name}. Ask questions like 'Top 5 customers' or 'Sales trend by month'."
-            state["status"] = "complete"
-        
-        return state
-    
-    async def _handle_context(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Answer questions about dashboard state."""
-        question = state.get("question", "")
-        context = state.get("dashboard_context", {})
-        
-        dashboard_name = context.get("dashboard_name", "Dashboard")
-        filters = self._sanitize_filters(context.get("filters", []))
-        worksheets = context.get("worksheets", [])
-        
-        filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
-        worksheets_str = ", ".join([w.get("name", "") for w in worksheets]) if worksheets else "Unknown"
+        # (c) Cross-datasource awareness
         datasources = context.get("datasources", [])
-        datasources_str = ", ".join([ds.get("name", "") for ds in datasources]) if datasources else "Unknown"
+        if len(datasources) > 1:
+            ds_names = [d.get("name", "Unknown") for d in datasources]
+            enrichment_str += f"\n\nAvailable datasources: {', '.join(ds_names)}. You may plan queries across different datasources for richer cross-cutting analysis."
+        
+        # (d) Feedback-driven learning
+        feedback_ctx = await self._get_feedback_context(question)
+        if feedback_ctx:
+            enrichment_str += feedback_ctx
+        
+        prompt = ORCHESTRATOR_SYSTEM.format(
+            dashboard_name=context.get("dashboard_name", "Unknown"),
+            filters=json.dumps(context.get("filters", [])),
+            worksheets=", ".join([w.get("name", "") for w in context.get("worksheets", [])]),
+            history=history_str,
+            question=question
+        )
+        
+        # Append domain knowledge after the prompt
+        if enrichment_str:
+            prompt = prompt + enrichment_str
         
         try:
-            system_prompt = CONTEXT_RESPONSE_SYSTEM.format(
-                dashboard_name=dashboard_name,
-                filters=filters_str,
-                worksheets=worksheets_str,
-                datasources=datasources_str
-            )
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            content = response.content.strip()
             
-            response = await self.llm.ainvoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=question)
-            ])
+            # --- Phase 3: Robust JSON extraction ---
+            plan_data = self._extract_json(content)
+            plan = plan_data.get("plan", [])
             
-            state["analysis"] = response.content
-            state["status"] = "complete"
+            if not plan:
+                logger.warning("Orchestrator returned empty plan, defaulting to data_query")
+                plan = [{"expert": "data_query", "question": question, "reasoning": "Fallback"}]
+                
+            logger.info("Plan generated", steps=len(plan), plan=[p['expert'] for p in plan])
+            
+            return {
+                "plan": plan,
+                "current_step_index": -1,  # Sentinel: custom reducer resets to 0
+                "step_results": [],          # Sentinel: custom reducer clears old results
+                "messages": [HumanMessage(content=question)] # Persists via add reducer
+            }
             
         except Exception as e:
-            state["analysis"] = f"Dashboard: {dashboard_name}. Filters: {filters_str}."
-            state["status"] = "complete"
+            logger.error("Orchestration failed", error=str(e))
+            # Fallback to simple data query
+            return {
+                "plan": [{"expert": "data_query", "question": question, "reasoning": "Error fallback"}],
+                "current_step_index": -1,  # Sentinel: reset
+                "step_results": [],
+                "messages": [HumanMessage(content=question)]
+            }
+
+    async def _replan(self, state: DashboardAgentState) -> DashboardAgentState:
+        """The Adaptive node: Reviews progress and adjusts the plan if needed."""
+        step_results = state.get("step_results", [])
+        if not step_results:
+            return state
+            
+        last_result = step_results[-1]
         
+        # 1. If the last expert flagged that clarification is needed, stop the plan early
+        if last_result.get("needs_clarification"):
+            logger.info("Clarification needed, truncating plan")
+            state["current_step_index"] = len(state.get("plan", []))
+            
+        # 2. If the last step was a critical data error, stop the pipeline
+        # Don't run anomaly/comparison on top of a failed data query
+        if last_result.get("error") and last_result.get("expert") in [
+            "data_query", "comparison", "anomaly", "storytelling"
+        ]:
+            logger.warning(
+                "Data pipeline error, stopping plan execution",
+                expert=last_result.get("expert"),
+                error=str(last_result.get("error"))[:100]
+            )
+            state["current_step_index"] = len(state.get("plan", []))
+
+        return state
+
+    async def _synthesize(self, state: DashboardAgentState) -> DashboardAgentState:
+        """The Final node: Merges all expert outputs into a single premium narrative."""
+        question = state.get("question", "")
+        step_results = state.get("step_results", [])
+        
+        if not step_results:
+            state["analysis"] = "I couldn't gather enough data to answer that."
+            state["status"] = "complete"
+            return state
+            
+        logger.info("Synthesizing final response", step_count=len(step_results))
+        
+        # --- Aggregate technical fields from ALL steps ---
+        for res in reversed(step_results):
+            if res.get("results") and not state.get("results"):
+                state["results"] = res["results"]
+            if res.get("visualization") and not state.get("visualization"):
+                state["visualization"] = res["visualization"]
+            if res.get("needs_clarification"):
+                state["needs_clarification"] = True
+            
+            # If we have a dashboard action, merge it into results
+            if res.get("dashboard_action") and not state.get("results", {}).get("dashboard_action"):
+                if not state.get("results"): state["results"] = {}
+                state["results"]["dashboard_action"] = res["dashboard_action"]
+        
+        # --- Map expert name to user-facing intent ---
+        expert_to_intent = {
+            "chat": "chat",
+            "capability": "capability",
+            "dashboard_context": "dashboard_context",
+            "dashboard_action": "dashboard_action",
+            "clarification": "clarification",
+            "data_query": "data_query",
+            "comparison": "comparison",
+            "anomaly": "anomaly",
+            "storytelling": "storytelling",
+        }
+        if step_results:
+            primary_expert = step_results[0].get("expert", "data_query")
+            state["intent"] = expert_to_intent.get(primary_expert, "data_query")
+        
+        # --- NON-DATA EXPERT BYPASS: Return raw handler output for chat/capability/context/action ---
+        NON_DATA_EXPERTS = {"chat", "capability", "dashboard_context", "dashboard_action", "clarification"}
+        DATA_EXPERTS = {"data_query", "comparison", "anomaly", "storytelling"}
+        
+        primary_expert = step_results[0].get("expert", "") if step_results else ""
+        all_non_data = all(r.get("expert") in NON_DATA_EXPERTS for r in step_results)
+        
+        if all_non_data:
+            # For non-data intents, return the handler's analysis directly — no LLM synthesis
+            analysis = step_results[-1].get("analysis", "")
+            state["analysis"] = analysis
+            state["status"] = "complete"
+            state["messages"] = [AIMessage(content=analysis)]
+            logger.info("Non-data expert: bypassing synthesis", expert=primary_expert)
+            return state
+        
+        # --- SINGLE-STEP DATA BYPASS: Skip LLM re-synthesis for single data expert ---
+        if len(step_results) == 1 and primary_expert in DATA_EXPERTS:
+            single = step_results[0]
+            analysis = single.get("analysis", "")
+            
+            # Generate proactive insights for data-oriented responses
+            analysis = await self._generate_proactive_insight(analysis, question)
+            
+            # Append trust footer (citation + confidence)
+            citation = single.get("citation")
+            if citation and isinstance(citation, SourceCitation):
+                citation_str = format_citation(citation)
+                if citation_str:
+                    analysis = f"{analysis}\n\n---\n{citation_str}"
+                confidence = single.get("confidence", "")
+                confidence_reason = single.get("confidence_reason", "")
+                if confidence:
+                    analysis = f"{analysis}\n{confidence} **Confidence** — {confidence_reason}"
+            
+            state["analysis"] = analysis
+            state["status"] = "complete"
+            state["messages"] = [AIMessage(content=state["analysis"])]
+            logger.info("Single-step data plan: bypassing synthesis LLM call")
+            return state
+        
+        # --- MULTI-STEP: Synthesize results from multiple experts ---
+        results_str = "\n---\n".join([
+            f"Expert: {res.get('expert')}\nQuestion: {res.get('question')}\nResult: {res.get('analysis') or 'Action completed'}"
+            for res in step_results
+        ])
+        
+        prompt = SYNTHESIS_SYSTEM.format(
+            question=question,
+            results=results_str
+        )
+        
+        try:
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            analysis = response.content.strip()
+            
+            # Append aggregated trust footer for multi-step plans
+            citations = [r.get("citation") for r in step_results if isinstance(r.get("citation"), SourceCitation)]
+            if citations:
+                citations_str = format_citations(citations)
+                if citations_str:
+                    analysis = f"{analysis}\n\n---\n{citations_str}"
+            
+            state["analysis"] = analysis
+            state["status"] = "complete"
+            
+            # Persistent AIMessage
+            state["messages"] = [AIMessage(content=state["analysis"])]
+            
+        except Exception as e:
+            logger.error("Synthesis failed", error=str(e))
+            # Fallback: concatenate raw expert outputs
+            state["analysis"] = "\n\n---\n\n".join([r.get("analysis", "") for r in step_results])
+            state["status"] = "complete"
+            
         return state
     
-    async def _handle_clarification(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Ask for clarification on vague questions."""
-        question = state.get("question", "")
+    
+    async def _handle_chat(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Handle conversational messages without data queries."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
+        
+        logger.info("Handling chat worker", question=question[:50])
+        
+        try:
+            response = await self.llm.ainvoke([
+                SystemMessage(content=CHAT_RESPONSE_SYSTEM),
+                HumanMessage(content=question)
+            ])
+            analysis = response.content
+        except Exception as e:
+            analysis = "I'm here to help! What would you like to know about your data?"
+            
+        return {
+            "step_results": [{
+                "expert": "chat",
+                "question": question,
+                "analysis": analysis
+            }],
+            "current_step_index": 1
+        }
+    
+    async def _handle_capability(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Explain capabilities briefly."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
         
         dashboard_name = context.get("dashboard_name", "your dashboard")
         datasources = [ds.get("name", "") for ds in context.get("datasources", [])]
         
+        logger.info("Handling capability worker")
+        
+        try:
+            system_prompt = CAPABILITY_RESPONSE_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                datasources=", ".join(datasources) if datasources else "your data"
+            )
+            
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=question)
+            ])
+            analysis = response.content
+        except Exception as e:
+            analysis = "I can analyze your data, find trends, and help you navigate this dashboard."
+            
+        return {
+            "step_results": [{
+                "expert": "capability",
+                "question": question,
+                "analysis": analysis
+            }],
+            "current_step_index": 1
+        }
+    
+    async def _handle_context(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Explain the current dashboard state."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
+        context = state.get("dashboard_context", {})
+        
+        dashboard_name = context.get("dashboard_name", "Dashboard")
+        worksheets = [w.get("name", "") for w in context.get("worksheets", [])]
+        filters = [f"{f.get('field')}={f.get('value')}" for f in context.get("filters", [])]
+        datasources = [ds.get("name", "") for ds in context.get("datasources", [])]
+        
+        logger.info("Handling context worker")
+        
+        try:
+            system_prompt = CONTEXT_RESPONSE_SYSTEM.format(
+                dashboard_name=dashboard_name,
+                filters=", ".join(filters) if filters else "None",
+                worksheets=", ".join(worksheets) if worksheets else "None",
+                datasources=", ".join(datasources) if datasources else "None"
+            )
+            
+            response = await self.llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=question)
+            ])
+            analysis = response.content
+        except Exception as e:
+            analysis = f"You are viewing '{dashboard_name}'."
+            
+        return {
+            "step_results": [{
+                "expert": "dashboard_context",
+                "question": question,
+                "analysis": analysis
+            }],
+            "current_step_index": 1
+        }
+    
+    async def _handle_clarification(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Ask for clarification on vague questions."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
+        context = state.get("dashboard_context", {})
+        
+        dashboard_name = context.get("dashboard_name", "your dashboard")
+        datasources = [ds.get("name", "") for ds in context.get("datasources", [])]
+        
+        logger.info("Handling clarification worker")
+        
         try:
             system_prompt = CLARIFICATION_SYSTEM.format(
                 dashboard_name=dashboard_name,
-                datasources=", ".join(datasources) if datasources else "your data"
+                datasources=", ".join(datasources) if datasources else "your data",
+                filters=", ".join([f"{f.get('field')}={f.get('value')}" for f in context.get("filters", [])]) if context.get("filters") else "None"
             )
             
             response = await self.llm.ainvoke([
@@ -815,20 +942,26 @@ RESOLVED_QUESTION: <the clean standalone question, or the original if not a foll
                 HumanMessage(content=f"User said: '{question}'")
             ])
             
-            state["analysis"] = response.content
-            state["needs_clarification"] = True
-            state["status"] = "complete"
-            
+            analysis = response.content
         except Exception as e:
-            state["analysis"] = "Could you be more specific? Try: 'Total sales by region' or 'Top 5 customers'"
-            state["needs_clarification"] = True
-            state["status"] = "complete"
-        
-        return state
+            analysis = "Could you be more specific? Try: 'Total sales by region' or 'Top 5 customers'"
+            
+        return {
+            "step_results": [{
+                "expert": "clarification",
+                "question": question,
+                "analysis": analysis,
+                "needs_clarification": True
+            }],
+            "current_step_index": 1
+        }
     
-    async def _handle_dashboard_action(self, state: DashboardAgentState) -> DashboardAgentState:
+    async def _handle_dashboard_action(self, state: DashboardAgentState) -> Dict[str, Any]:
         """Handle requests to modify the dashboard (filters, parameters, navigation)."""
-        question = state.get("question", "")
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
         
         dashboard_name = context.get("dashboard_name", "Dashboard")
@@ -840,19 +973,25 @@ RESOLVED_QUESTION: <the clean standalone question, or the original if not a foll
         filters_str = ", ".join([f"{f.get('field')}={f.get('value', 'All')}" for f in filters]) if filters else "None"
         parameters_str = ", ".join([f"{p.get('name')}={p.get('value', '')}" for p in parameters]) if parameters else "None"
         
+        logger.info("Handling dashboard action worker")
+        
         if not worksheets:
-            state["analysis"] = "I can't see any worksheets in your dashboard. If you're running this in Tableau, try refreshing the extension. If you're in standalone mode, some dashboard actions won't be available."
-            state["intent"] = "clarification"
-            state["status"] = "complete"
-            return state
+            return {
+                "step_results": [{
+                    "expert": "dashboard_action",
+                    "question": question,
+                    "analysis": "I can't see any worksheets in your dashboard. If you're running this in Tableau, try refreshing the extension.",
+                    "error": "No worksheets detected"
+                }],
+                "current_step_index": 1
+            }
 
         try:
             system_prompt = DASHBOARD_ACTION_SYSTEM.format(
                 dashboard_name=dashboard_name,
                 worksheets=worksheets_str,
                 filters=filters_str,
-                parameters=parameters_str,
-                question=question
+                parameters=parameters_str
             )
             
             response = await self.llm.ainvoke([
@@ -860,336 +999,380 @@ RESOLVED_QUESTION: <the clean standalone question, or the original if not a foll
                 HumanMessage(content=question)
             ])
             
-            # Parse the JSON response
-            import json
-            try:
-                action_data = json.loads(response.content.strip())
-            except json.JSONDecodeError:
-                # Try to extract JSON from response
-                import re
-                json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
-                if json_match:
-                    action_data = json.loads(json_match.group())
-                else:
-                    action_data = {
-                        "action": "error",
-                        "message": "I couldn't understand that action. Try 'filter by Region = West' or 'clear filters'."
-                    }
+            # Parse JSON action
+            content = response.content.strip()
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
             
-            # Build response with action command for frontend
-            state["analysis"] = action_data.get("message", "Action processed.")
+            action_data = json.loads(content)
             
-            # Check if there was a pending scope clarification — if so,
-            # the user answered a scope question with a filter change (e.g.
-            # "What is the sales trend?" → scope ask → "for east region")
-            # In that case, include the original question for auto-requery
-            history = state.get("messages", [])
-            scope_markers = ["Would you like results for", "Current view", "All data (global"]
-            for msg in reversed(history):
-                if isinstance(msg, AIMessage):
-                    if any(marker in msg.content for marker in scope_markers):
-                        # Found a pending scope clarification — find the original question
-                        for msg2 in reversed(history):
-                            if isinstance(msg2, HumanMessage):
-                                original_q = msg2.content
-                                # Don't include the current question (which is the action)
-                                if original_q.lower().strip() != question.lower().strip():
-                                    action_data["auto_requery"] = original_q
-                                    logger.info("Pending scope clarification detected — will auto-requery",
-                                               original_q=original_q[:50])
-                                    break
-                    break  # Only check the most recent AI message
-            
-            state["results"] = {
-                "dashboard_action": action_data
-            }
-            state["status"] = "complete"
+            # Clean action message badge
+            if action_data.get("message"):
+                 action_data["message"] = f"⚡ **Dashboard Action:** {action_data['message']}"
             
             logger.info("Dashboard action parsed", action=action_data.get("action"))
             
+            return {
+                "step_results": [{
+                    "expert": "dashboard_action",
+                    "question": question,
+                    "analysis": action_data.get("message", "Dashboard action triggered."),
+                    "dashboard_action": action_data
+                }],
+                "current_step_index": 1
+            }
+            
         except Exception as e:
-            logger.error("Dashboard action handler error", error=str(e))
-            state["analysis"] = "I couldn't process that action. Try: 'filter by Region = West' or 'clear all filters'."
-            state["status"] = "complete"
-        
-        # Add to conversation history so subsequent turns see the context change
-        state["messages"] = [AIMessage(content=f"[DASHBOARD_ACTION] {state.get('analysis', '')}")]
-        
-        return state
+            logger.error("Dashboard action worker failed", error=str(e))
+            return {
+                "step_results": [{
+                    "expert": "dashboard_action",
+                    "question": question,
+                    "analysis": f"Failed to perform dashboard action: {str(e)}",
+                    "error": str(e)
+                }],
+                "current_step_index": 1
+            }
     
-    async def _handle_data_query(self, state: DashboardAgentState) -> DashboardAgentState:
+    async def _handle_data_query(self, state: DashboardAgentState) -> Dict[str, Any]:
         """Delegate data query to Data Agent (VizQL) with context scope handling."""
-        question = state.get("question", "")
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
-        filters = context.get("filters", [])
         
-        # Sanitize filters to remove problematic fields before query planning
-        filters = self._sanitize_filters(filters)
+        # Aggregate base filters and orchestrated filters
+        base_filters = self._sanitize_filters(context.get("filters", []))
+        orch_filters = self._get_orchestrated_filters(state)
+        filters = self._merge_filters(base_filters, orch_filters)
         
-        logger.info("Delegating to Data Agent", question=question[:50])
+        logger.info("Handling data query worker", question=question[:50], orch_filters=len(orch_filters))
         
         try:
-            # Use pre-resolved scope (from follow-up answer) or detect it
+            # Use pre-resolved scope or detect it
             context_scope = state.get("context_scope")
             if not context_scope:
                 context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
-                state["context_scope"] = context_scope
             
-            logger.info("Context scope resolved", scope=context_scope, filters_count=len(filters))
-            
-            # Handle ambiguous scope - ask user
+            # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
-                state["needs_clarification"] = True
                 clarification = self._create_scope_clarification(filters, "data")
-                state["analysis"] = clarification
-                state["messages"] = [AIMessage(content=clarification)]  # Persist via add reducer
-                state["status"] = "clarification_needed"
-                return state
+                return {
+                    "step_results": [{
+                        "expert": "data_query",
+                        "question": question,
+                        "analysis": clarification,
+                        "needs_clarification": True
+                    }],
+                    "current_step_index": 1
+                }
             
-            # Build filter context for query enhancement
             filter_context = None
             if context_scope == "filtered" and filters:
                 filter_context = self._build_filter_context(filters)
-                logger.info("Applying dashboard filters to query", filter_context=filter_context)
             
-            # Enhance question with filter context if applicable
             enhanced_question = question
             if filter_context:
                 enhanced_question = f"{question}\n\n[Dashboard Filter Context: {filter_context}. Apply these filters to the query.]"
             
-            # Call Data Agent's execute_data_query
-            result = await self.data_agent.execute_data_query(
+            result = await self._execute_with_retry(
                 question=enhanced_question,
                 datasource_id=None,
                 filters=filters if context_scope == "filtered" else None
             )
             
-            # Map result to state
-            state["analysis"] = result.get("analysis", "")
-            state["results"] = result.get("results")
-            state["visualization"] = result.get("visualization")
-            state["error"] = result.get("error")
-            state["status"] = "complete" if result.get("success") else "error"
+            # --- Trust Layer: validate and cite ---
+            citation = build_citation_from_result(result, filters)
+            confidence_level, confidence_reason = compute_confidence(result)
+            analysis = validate_data_response(result.get("analysis", ""), result)
             
-            # Enrich with dashboard context (scope indicator)
-            if result.get("success") and state.get("analysis"):
+            if citation.data_grounded and analysis:
                 scope_indicator = "🔍 **Data Scope:** " + (
                     f"Filtered by {filter_context}" if context_scope == "filtered" and filter_context
                     else "All data (global)"
                 )
-                state["analysis"] = f"{scope_indicator}\n\n{state['analysis']}"
-                # Only show dashboard context footer when filters were actually applied
+                analysis = f"{scope_indicator}\n\n{analysis}"
                 if context_scope == "filtered":
-                    state["analysis"] = self._enrich_with_context(state["analysis"], context)
+                    analysis = self._enrich_with_context(analysis, context)
+            
+            return {
+                "step_results": [{
+                    "expert": "data_query",
+                    "question": question,
+                    "analysis": analysis,
+                    "results": result.get("results"),
+                    "visualization": result.get("visualization"),
+                    "error": result.get("error"),
+                    "status": "complete" if result.get("success") else "error",
+                    "citation": citation,
+                    "confidence": confidence_level,
+                    "confidence_reason": confidence_reason,
+                }],
+                "current_step_index": 1
+            }
             
         except Exception as e:
-            logger.error("Data query failed", error=str(e))
-            state["error"] = str(e)
-            state["analysis"] = f"Error analyzing data: {str(e)}"
-            state["status"] = "error"
-        
-        return state
-    
-    async def _handle_comparison(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Handle comparison queries (Q1 vs Q2, year-over-year, region comparisons)."""
-        question = state.get("question", "")
+            logger.error("Data query worker failed", error=str(e))
+            return {
+                "step_results": [{
+                    "expert": "data_query",
+                    "question": question,
+                    "analysis": f"⚠️ **Data Unavailable:** Failed to query Tableau data.\n\n**Reason:** {str(e)}\n\nI will not generate a response without verified data.",
+                    "error": str(e)
+                }],
+                "current_step_index": 1
+            }
+
+    async def _handle_comparison(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Handle comparison queries."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
-        filters = self._sanitize_filters(context.get("filters", []))
         
-        logger.info("Handling comparison query", question=question[:50])
-        state["query_type"] = "comparison"
+        # Aggregate base filters and orchestrated filters
+        base_filters = self._sanitize_filters(context.get("filters", []))
+        orch_filters = self._get_orchestrated_filters(state)
+        filters = self._merge_filters(base_filters, orch_filters)
+        
+        logger.info("Handling comparison worker", question=question[:50], orch_filters=len(orch_filters))
         
         try:
-            # Enhance the question with comparison-specific instructions
             enhanced_question = f"""{question}
 
 [COMPARISON ANALYSIS REQUIRED]
-This is a comparison query. Please:
-1. Identify the two or more elements being compared
-2. Query data for each element separately if needed
-3. Calculate differences and percentage changes
-4. Structure the response with a clear comparison table
-5. Highlight the winner/better performer
-6. Note the biggest differences"""
+Please identify elements being compared, calculate differences, and highlight performers."""
             
-            # Use pre-resolved scope or detect it
-            context_scope = state.get("context_scope")
-            if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
-                state["context_scope"] = context_scope
+            context_scope = state.get("context_scope") or await self._detect_context_scope(question, filters, state.get("messages", []))
             
-            # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
-                state["needs_clarification"] = True
-                clarification = self._create_scope_clarification(filters, "comparison")
-                state["analysis"] = clarification
-                state["messages"] = [AIMessage(content=clarification)]
-                state["status"] = "clarification_needed"
-                return state
+                return {
+                    "step_results": [{
+                        "expert": "comparison",
+                        "question": question,
+                        "analysis": self._create_scope_clarification(filters, "comparison"),
+                        "needs_clarification": True
+                    }],
+                    "current_step_index": 1
+                }
             
-            filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
-            if filter_context:
-                enhanced_question += f"\n\n[Dashboard Filter Context: {filter_context}]"
-            
-            result = await self.data_agent.execute_data_query(
+            result = await self._execute_with_retry(
                 question=enhanced_question,
                 datasource_id=None,
                 filters=filters if context_scope == "filtered" else None
             )
             
-            # Map result with comparison badge
-            if result.get("success") and result.get("analysis"):
-                state["analysis"] = f"📊 **Comparison Analysis**\n\n{result.get('analysis', '')}"
-            else:
-                state["analysis"] = result.get("analysis", "")
+            # --- Trust Layer ---
+            citation = build_citation_from_result(result, filters)
+            confidence_level, confidence_reason = compute_confidence(result)
+            analysis = validate_data_response(result.get("analysis", ""), result)
             
-            state["results"] = result.get("results")
-            state["visualization"] = result.get("visualization")
-            state["error"] = result.get("error")
-            state["status"] = "complete" if result.get("success") else "error"
+            if citation.data_grounded and analysis:
+                analysis = f"📊 **Comparison Analysis**\n\n{analysis}"
             
+            return {
+                "step_results": [{
+                    "expert": "comparison",
+                    "question": question,
+                    "analysis": analysis,
+                    "results": result.get("results"),
+                    "visualization": result.get("visualization"),
+                    "error": result.get("error"),
+                    "citation": citation,
+                    "confidence": confidence_level,
+                    "confidence_reason": confidence_reason,
+                }],
+                "current_step_index": 1
+            }
         except Exception as e:
-            logger.error("Comparison query failed", error=str(e))
-            state["error"] = str(e)
-            state["analysis"] = f"Error in comparison analysis: {str(e)}"
-            state["status"] = "error"
-        
-        return state
-    
-    async def _handle_anomaly(self, state: DashboardAgentState) -> DashboardAgentState:
+            return {
+                "step_results": [{
+                    "expert": "comparison",
+                    "question": question,
+                    "analysis": f"⚠️ **Data Unavailable:** Failed to run comparison.\n\n**Reason:** {str(e)}"
+                }],
+                "current_step_index": 1
+            }
+
+    async def _handle_anomaly(self, state: DashboardAgentState) -> Dict[str, Any]:
         """Handle anomaly detection queries (outliers, unusual patterns)."""
-        question = state.get("question", "")
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
-        filters = self._sanitize_filters(context.get("filters", []))
         
-        logger.info("Handling anomaly detection query", question=question[:50])
-        state["query_type"] = "anomaly"
+        # Aggregate base filters and orchestrated filters
+        base_filters = self._sanitize_filters(context.get("filters", []))
+        orch_filters = self._get_orchestrated_filters(state)
+        filters = self._merge_filters(base_filters, orch_filters)
+        
+        logger.info("Handling anomaly worker", question=question[:50], orch_filters=len(orch_filters))
         
         try:
-            # Enhance the question with anomaly detection instructions
             enhanced_question = f"""{question}
 
 [ANOMALY DETECTION REQUIRED]
-This is an anomaly detection query. Please:
-1. Retrieve relevant data with sufficient rows to detect patterns
-2. Calculate statistical measures (mean, std dev, percentiles)
-3. Identify values that deviate significantly (>2 standard deviations or outside IQR*1.5)
-4. Check for sudden spikes or drops compared to previous periods
-5. Note any missing or unexpected patterns
-6. Rate each anomaly by severity (High/Medium/Low)
-7. Suggest possible root causes"""
+Please identify outliers, sudden spikes/drops, and rate their severity."""
             
-            # Use pre-resolved scope or detect it
-            context_scope = state.get("context_scope")
-            if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
-                state["context_scope"] = context_scope
+            context_scope = state.get("context_scope") or await self._detect_context_scope(question, filters, state.get("messages", []))
             
-            # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
-                state["needs_clarification"] = True
-                clarification = self._create_scope_clarification(filters, "anomaly")
-                state["analysis"] = clarification
-                state["messages"] = [AIMessage(content=clarification)]
-                state["status"] = "clarification_needed"
-                return state
+                return {
+                    "step_results": [{
+                        "expert": "anomaly",
+                        "question": question,
+                        "analysis": self._create_scope_clarification(filters, "anomaly"),
+                        "needs_clarification": True
+                    }],
+                    "current_step_index": 1
+                }
             
-            filter_context = self._build_filter_context(filters) if context_scope == "filtered" and filters else None
-            if filter_context:
-                enhanced_question += f"\n\n[Dashboard Filter Context: {filter_context}]"
-            
-            result = await self.data_agent.execute_data_query(
+            result = await self._execute_with_retry(
                 question=enhanced_question,
                 datasource_id=None,
                 filters=filters if context_scope == "filtered" else None
             )
             
-            # Map result with anomaly badge
-            if result.get("success") and result.get("analysis"):
-                state["analysis"] = f"🔍 **Anomaly Detection Results**\n\n{result.get('analysis', '')}"
-            else:
-                state["analysis"] = result.get("analysis", "")
+            # --- Trust Layer ---
+            citation = build_citation_from_result(result, filters)
+            confidence_level, confidence_reason = compute_confidence(result)
+            analysis = validate_data_response(result.get("analysis", ""), result)
             
-            state["results"] = result.get("results")
-            state["visualization"] = result.get("visualization")
-            state["error"] = result.get("error")
-            state["status"] = "complete" if result.get("success") else "error"
+            if citation.data_grounded and analysis:
+                analysis = f"🔍 **Anomaly Detection**\n\n{analysis}"
             
+            return {
+                "step_results": [{
+                    "expert": "anomaly",
+                    "question": question,
+                    "analysis": analysis,
+                    "results": result.get("results"),
+                    "visualization": result.get("visualization"),
+                    "error": result.get("error"),
+                    "citation": citation,
+                    "confidence": confidence_level,
+                    "confidence_reason": confidence_reason,
+                }],
+                "current_step_index": 1
+            }
         except Exception as e:
-            logger.error("Anomaly detection failed", error=str(e))
-            state["error"] = str(e)
-            state["analysis"] = f"Error in anomaly detection: {str(e)}"
-            state["status"] = "error"
-        
-        return state
-    
-    async def _handle_storytelling(self, state: DashboardAgentState) -> DashboardAgentState:
-        """Handle storytelling/narrative queries (executive summaries, presentations)."""
-        question = state.get("question", "")
+            return {
+                "step_results": [{
+                    "expert": "anomaly",
+                    "question": question,
+                    "analysis": f"⚠️ **Data Unavailable:** Failed to run anomaly detection.\n\n**Reason:** {str(e)}"
+                }],
+                "current_step_index": 1
+            }
+
+    async def _handle_storytelling(self, state: DashboardAgentState) -> Dict[str, Any]:
+        """Handle narrative summary/storytelling queries."""
+        plan = state.get("plan", [])
+        idx = state.get("current_step_index", 0)
+        task = plan[idx] if idx < len(plan) else {}
+        question = task.get("question", state.get("question", ""))
         context = state.get("dashboard_context", {})
-        filters = self._sanitize_filters(context.get("filters", []))
-        dashboard_name = context.get("dashboard_name", "Dashboard")
         
-        logger.info("Handling storytelling query", question=question[:50])
-        state["query_type"] = "storytelling"
+        # Aggregate base filters and orchestrated filters
+        base_filters = self._sanitize_filters(context.get("filters", []))
+        orch_filters = self._get_orchestrated_filters(state)
+        filters = self._merge_filters(base_filters, orch_filters)
+        
+        logger.info("Handling storytelling worker", orch_filters=len(orch_filters))
         
         try:
-            # Enhance the question with storytelling instructions
-            filter_context = self._build_filter_context(filters) if filters else "No filters applied"
-            
+            # For storytelling, we usually want significant context
             enhanced_question = f"""{question}
 
-[EXECUTIVE SUMMARY / DATA STORY REQUIRED]
-Dashboard: {dashboard_name}
-Filters: {filter_context}
-
-Please create a compelling data story:
-1. Start with "The Big Picture" - 2-3 sentences a CEO could understand in 10 seconds
-2. Identify the main takeaway, overall performance trend, key concern, and opportunity
-3. List 3-5 key metrics with values and trends
-4. Explain what the data means for the business
-5. Provide 3 actionable next steps
-6. Keep it concise but insightful - suitable for an exec presentation"""
+[STORYTELLING/NARRATIVE REQUIRED]
+Please provide a comprehensive narrative summary of the data."""
             
-            # Use pre-resolved scope or detect it
-            context_scope = state.get("context_scope")
-            if not context_scope:
-                context_scope = await self._detect_context_scope(question, filters, state.get("messages", []))
-                state["context_scope"] = context_scope
+            context_scope = state.get("context_scope") or await self._detect_context_scope(question, filters, state.get("messages", []))
             
-            # Handle ambiguous scope
             if context_scope == "ambiguous" and filters:
-                state["needs_clarification"] = True
-                clarification = self._create_scope_clarification(filters, "storytelling")
-                state["analysis"] = clarification
-                state["messages"] = [AIMessage(content=clarification)]
-                state["status"] = "clarification_needed"
-                return state
+                return {
+                    "step_results": [{
+                        "expert": "storytelling",
+                        "question": question,
+                        "analysis": self._create_scope_clarification(filters, "storytelling"),
+                        "needs_clarification": True
+                    }],
+                    "current_step_index": 1
+                }
             
-            result = await self.data_agent.execute_data_query(
+            result = await self._execute_with_retry(
                 question=enhanced_question,
                 datasource_id=None,
                 filters=filters if context_scope == "filtered" else None
             )
             
-            # Map result with storytelling badge
-            if result.get("success") and result.get("analysis"):
-                state["analysis"] = f"📖 **Dashboard Story: {dashboard_name}**\n\n{result.get('analysis', '')}"
-            else:
-                state["analysis"] = result.get("analysis", "")
+            # --- Trust Layer ---
+            citation = build_citation_from_result(result, filters)
+            confidence_level, confidence_reason = compute_confidence(result)
+            analysis = validate_data_response(result.get("analysis", ""), result)
             
-            state["results"] = result.get("results")
-            state["visualization"] = result.get("visualization")
-            state["error"] = result.get("error")
-            state["status"] = "complete" if result.get("success") else "error"
+            if citation.data_grounded and analysis:
+                analysis = f"📖 **Dashboard Story**\n\n{analysis}"
             
+            return {
+                "step_results": [{
+                    "expert": "storytelling",
+                    "question": question,
+                    "analysis": analysis,
+                    "results": result.get("results"),
+                    "visualization": result.get("visualization"),
+                    "error": result.get("error"),
+                    "citation": citation,
+                    "confidence": confidence_level,
+                    "confidence_reason": confidence_reason,
+                }],
+                "current_step_index": 1
+            }
         except Exception as e:
-            logger.error("Storytelling query failed", error=str(e))
-            state["error"] = str(e)
-            state["analysis"] = f"Error generating story: {str(e)}"
-            state["status"] = "error"
+            return {
+                "step_results": [{
+                    "expert": "storytelling",
+                    "question": question,
+                    "analysis": f"⚠️ **Data Unavailable:** Failed to generate story.\n\n**Reason:** {str(e)}"
+                }],
+                "current_step_index": 1
+            }
+
+    def _get_orchestrated_filters(self, state: DashboardAgentState) -> List[Dict]:
+        """Aggregate filters from previous dashboard actions in the current plan execution."""
+        step_results = state.get("step_results", [])
+        orch_filters = []
         
-        return state
+        for res in step_results:
+            if res.get("expert") == "dashboard_action" and res.get("dashboard_action"):
+                action = res["dashboard_action"]
+                if action.get("action") == "apply_filter":
+                    field = action.get("field")
+                    values = action.get("values", [])
+                    if field and values:
+                        # Convert to DashboardContext filter format
+                        orch_filters.append({
+                            "field": field,
+                            "value": values[0] if isinstance(values, list) else values,
+                            "is_orchestrated": True
+                        })
+                elif action.get("action") == "clear_all_filters":
+                    orch_filters = [] # Simplification: clear overrides
+                    
+        return orch_filters
+
+    def _merge_filters(self, base: List[Dict], orch: List[Dict]) -> List[Dict]:
+        """Merge base filters with orchestrated filters (orch takes precedence)."""
+        if not orch: return base
+        
+        merged = {f["field"]: f for f in base}
+        for f in orch:
+            merged[f["field"]] = f
+            
+        return list(merged.values())
     
     async def _detect_context_scope(self, question: str, filters: List[Dict], history: List[BaseMessage] = None) -> str:
         """
@@ -1240,10 +1423,10 @@ Determine the user's data scope intent. Respond with exactly one word:
 CRITICAL rules (follow in order):
 1. If the question contains explicit global signals ("all data", "complete data", "across all", "overall", "entire dataset", "globally", "whole data", "ignoring filters", "without filters"), return GLOBAL
 2. If the question contains explicit filtered signals ("this view", "here", "current view", "as filtered", "with these filters", "in this scope"), return FILTERED
-3. If conversation history shows the most recent AI message was a dashboard action (marker: "[DASHBOARD_ACTION]"), this indicates the user just adjusted their view — for generic/ambiguous questions, return FILTERED
-4. If conversation history shows the user previously chose a scope (look for "Data Scope: All data" or "Data Scope: Filtered" in AI responses), carry that preference forward — return the same scope
-5. If NONE of the above apply (generic question with no scope words, no prior preference, and no recent action), return AMBIGUOUS
-6. When in doubt, return AMBIGUOUS — it is better to ask the user than to guess wrong
+3. If conversation history shows the most recent AI message was a dashboard action (marker: "[DASHBOARD_ACTION]"), return FILTERED
+4. If conversation history shows the user previously chose a scope, carry that preference forward
+5. For ANY other case — including generic questions like "top 5 products" or "show me sales" — return FILTERED. An expert analyst always uses the active dashboard context.
+6. NEVER return AMBIGUOUS. Always make a decision.
 
 Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
 
@@ -1343,6 +1526,263 @@ Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
     # =========================================================================
     # Helper Methods
     # =========================================================================
+    
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        """
+        Robustly extract JSON from LLM output.
+        
+        Handles:
+        - Clean JSON: {"plan": [...]}
+        - Markdown wrapped: ```json\n{...}\n```
+        - Extra text before/after: "Here is the plan:\n{...}\nLet me know"
+        - Regex fallback for edge cases
+        """
+        text = text.strip()
+        
+        # 1. Try direct parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        
+        # 2. Try stripping markdown code blocks
+        if "```" in text:
+            # Match ```json ... ``` or ``` ... ```
+            match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1).strip())
+                except json.JSONDecodeError:
+                    pass
+        
+        # 3. Try finding JSON object with regex
+        match = re.search(r'\{[^{}]*"plan"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        # 4. Try finding any JSON object
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        # 5. All parsing failed
+        logger.error("JSON extraction failed completely", raw_text=text[:200])
+        raise ValueError(f"Could not extract valid JSON from LLM output: {text[:100]}...")
+    
+    async def _execute_with_retry(self, question: str, datasource_id=None, filters=None) -> Dict[str, Any]:
+        """
+        Execute a data query with retry logic for transient failures.
+        
+        Retries up to 2 times on connection/timeout errors with exponential backoff.
+        Does NOT retry on query logic errors (wrong field names, etc).
+        """
+        last_error = None
+        for attempt in range(3):  # 1 initial + 2 retries
+            try:
+                result = await self.data_agent.execute_data_query(
+                    question=question,
+                    datasource_id=datasource_id,
+                    filters=filters
+                )
+                
+                # If the result itself indicates a transient error, retry
+                error = result.get("error", "")
+                if error and attempt < 2 and any(t in error.lower() for t in ["timeout", "connection", "unavailable", "502", "503"]):
+                    logger.warning(f"Transient data query error (attempt {attempt+1}/3), retrying...", error=error[:100])
+                    await asyncio.sleep(1.5 ** attempt)  # exponential backoff: 1s, 1.5s
+                    last_error = error
+                    continue
+                
+                # Auto-discover schema on success (Fix 4: self-learning)
+                if result.get("success"):
+                    self._auto_discover_schema(result)
+                
+                return result
+                
+            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                last_error = str(e)
+                if attempt < 2:
+                    logger.warning(f"Transient error (attempt {attempt+1}/3), retrying...", error=str(e)[:100])
+                    await asyncio.sleep(1.5 ** attempt)
+                else:
+                    logger.error("All retry attempts exhausted", error=str(e)[:100])
+                    return {"success": False, "error": f"Failed after 3 attempts: {e}", "results": {}}
+        
+        return {"success": False, "error": f"Failed after 3 attempts: {last_error}", "results": {}}
+    
+    def _auto_discover_schema(self, result: Dict[str, Any]) -> None:
+        """
+        Auto-populate data dictionary from successful query results.
+        
+        This makes the system self-learning: the first successful query teaches
+        the agent what fields exist in the datasource, improving future queries.
+        """
+        from src.agent.data_dictionary import get_data_dictionary, set_data_dictionary, DataDictionary, FieldDefinition
+        
+        dd = get_data_dictionary()
+        if dd and not dd.is_empty():
+            return  # Already populated, skip
+        
+        # Extract field names from result data
+        data = result.get("results", {}).get("data", [])
+        if not data:
+            return
+        
+        # Build field definitions from the column names we see
+        fields = []
+        sample_row = data[0]
+        for col_name, value in sample_row.items():
+            data_type = "number" if isinstance(value, (int, float)) else "text"
+            fields.append(FieldDefinition(
+                field_name=col_name,
+                business_name=col_name,  # Same as field name initially
+                description=f"Auto-discovered from query results",
+                data_type=data_type,
+                example_values=[str(value)][:3] if value is not None else [],
+            ))
+        
+        if fields:
+            new_dd = DataDictionary(fields=fields)
+            set_data_dictionary(new_dd)
+            ds_name = result.get("datasource", {}).get("name", "Unknown")
+            logger.info(f"Auto-discovered schema from {ds_name}", field_count=len(fields))
+    
+    def _build_trust_metadata(self, state_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build structured trust metadata for frontend rendering.
+        
+        Returns a dict with:
+        - citations: list of source citation dicts
+        - confidence: {level, emoji, reason}
+        - datasources_used: list of datasource names
+        - row_count: total rows analyzed
+        """
+        step_results = state_data.get("step_results", [])
+        citations = []
+        total_rows = 0
+        datasources = set()
+        confidence_level = "unknown"
+        confidence_emoji = "⚪"
+        confidence_reason = ""
+        
+        for res in step_results:
+            citation = res.get("citation")
+            if citation and isinstance(citation, SourceCitation):
+                citations.append({
+                    "datasource": citation.datasource_name,
+                    "row_count": citation.row_count,
+                    "filters_applied": citation.filters_applied,
+                    "timestamp": citation.timestamp,
+                    "query_time_ms": citation.query_time_ms,
+                    "data_grounded": citation.data_grounded,
+                })
+                total_rows += citation.row_count
+                datasources.add(citation.datasource_name)
+            
+            # Extract confidence from step results
+            if res.get("confidence"):
+                confidence_level = "high" if "🟢" in res["confidence"] else "medium" if "🟡" in res["confidence"] else "low"
+                confidence_emoji = res["confidence"].split(" ")[0] if res["confidence"] else "⚪"
+                confidence_reason = res.get("confidence_reason", "")
+        
+        return {
+            "citations": citations,
+            "confidence": {
+                "level": confidence_level,
+                "emoji": confidence_emoji,
+                "reason": confidence_reason,
+            },
+            "datasources_used": list(datasources),
+            "total_rows_analyzed": total_rows,
+        }
+    
+    async def _generate_proactive_insight(self, analysis: str, question: str) -> str:
+        """
+        Generate proactive insight for single-step responses.
+        
+        For single-step plans (which skip synthesis), the ANALYZER_PROMPT
+        doesn't include proactive insights. This method adds them via a
+        lightweight LLM call.
+        """
+        # Skip for non-data intents
+        if not analysis or len(analysis) < 50:
+            return analysis
+        
+        try:
+            insight_prompt = f"""Based on this data analysis, suggest 2-3 proactive follow-up insights.
+
+Question asked: {question}
+Analysis provided: {analysis[:500]}
+
+Respond with ONLY:
+💡 **You might also want to explore:**
+- [Observation about a pattern worth investigating]
+- [A follow-up question that would deepen understanding]
+- [A related metric or dimension the user should check]
+
+Be specific to the data discussed. No generic suggestions."""
+            
+            response = await self.llm.ainvoke([HumanMessage(content=insight_prompt)])
+            insight_text = response.content.strip()
+            
+            if insight_text and "💡" in insight_text:
+                return f"{analysis}\n\n{insight_text}"
+            return analysis
+            
+        except Exception as e:
+            logger.warning("Proactive insight generation failed", error=str(e))
+            return analysis
+    
+    async def _get_feedback_context(self, question: str) -> str:
+        """
+        Retrieve relevant past feedback to inform query planning.
+        
+        Queries the QueryFeedback table for similar past queries and their
+        feedback, returning a context string that helps the orchestrator
+        learn from past mistakes and successes.
+        """
+        try:
+            from src.db.database import get_session
+            from src.db.models import Query as QueryModel, QueryFeedback, FeedbackType
+            from sqlalchemy import select, desc
+            
+            async with get_session() as session:
+                # Get recent disliked queries to learn from failures
+                stmt = (
+                    select(QueryModel.question, QueryModel.response_text, QueryFeedback.comment)
+                    .join(QueryFeedback, QueryModel.id == QueryFeedback.query_id)
+                    .where(QueryFeedback.feedback_type == FeedbackType.DISLIKE)
+                    .order_by(desc(QueryFeedback.created_at))
+                    .limit(3)
+                )
+                result = await session.execute(stmt)
+                disliked = result.all()
+                
+                if not disliked:
+                    return ""
+                
+                feedback_lines = []
+                for q, resp, comment in disliked:
+                    line = f"- Question: \"{q[:60]}\" was DISLIKED"
+                    if comment:
+                        line += f" (reason: {comment[:50]})"
+                    feedback_lines.append(line)
+                
+                return (
+                    "\n\n== LEARNING FROM PAST FEEDBACK ==\n"
+                    "The following past responses were rated poorly. Avoid similar approaches:\n"
+                    + "\n".join(feedback_lines)
+                )
+                
+        except Exception as e:
+            logger.debug("Feedback context retrieval skipped", error=str(e))
+            return ""
     
     def _build_config_context(self, config: Optional[Dict]) -> str:
         """Build prompt context from dashboard config."""
@@ -1483,6 +1923,8 @@ Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
         }
         
         # Thread for conversation memory
+        # Use session thread_id for multi-turn memory. Safe because custom reducers
+        # reset per-query ephemeral state (step_results, current_step_index) on each call.
         effective_thread_id = thread_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": effective_thread_id}}
         
@@ -1519,6 +1961,126 @@ Respond with exactly one word: FILTERED, GLOBAL, or AMBIGUOUS"""
                 "success": False,
                 "error": str(e),
                 "analysis": f"Error: {str(e)}",
+            }
+
+    async def process_stream(
+        self,
+        question: str,
+        dashboard_context: Optional[DashboardContext] = None,
+        username: str = "dashboard_user",
+        thread_id: Optional[str] = None
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Process a question and yield real-time orchestrated events using LangGraph's streaming.
+        """
+        dashboard_name = (dashboard_context or {}).get("dashboard_name", "")
+        config_service = get_config_service()
+        dashboard_cfg = config_service.get_config(dashboard_name)
+        
+        config_dict = None
+        if dashboard_cfg:
+            config_dict = {
+                "name": dashboard_cfg.name,
+                "kpis": [{"name": k.name, "field": k.field} for k in dashboard_cfg.kpis],
+                "ai_instructions": dashboard_cfg.ai_instructions,
+            }
+            
+        initial_state: DashboardAgentState = {
+            "question": question.strip(),
+            "username": username,
+            "dashboard_context": dashboard_context or {},
+            "dashboard_config": config_dict,
+            "status": "started",
+            "step_results": [],
+            "current_step_index": 0
+        }
+        
+        # Use session thread_id for multi-turn memory. Safe because custom reducers
+        # reset per-query ephemeral state (step_results, current_step_index) on each call.
+        effective_thread_id = thread_id or str(uuid.uuid4())
+        config = {"configurable": {"thread_id": effective_thread_id}}
+        
+        try:
+            # Stream the graph execution
+            async for event in self.graph.astream(initial_state, config=config, stream_mode="updates"):
+                # 'event' is a dict mapping node names to their updates
+                node_name = list(event.keys())[0]
+                update = event[node_name]
+                
+                if node_name == "orchestrate":
+                    plan = update.get("plan", [])
+                    # Show full reasoning chain for transparency
+                    plan_desc = []
+                    for i, p in enumerate(plan, 1):
+                        reason = p.get("reasoning", "")
+                        plan_desc.append(f"Step {i}: {p.get('expert')} — {p.get('question', '')[:60]}")
+                    yield {
+                        "event": "thinking",
+                        "message": f"📋 Plan ({len(plan)} steps):\\n" + "\\n".join(plan_desc),
+                        "plan": plan
+                    }
+                elif node_name == "synthesize":
+                    yield {
+                        "event": "analyzing",
+                        "message": "📝 Synthesizing final response with source citations..."
+                    }
+                elif node_name in ["handle_data_query", "handle_comparison", "handle_anomaly", "handle_storytelling"]:
+                    # Extract step details from update
+                    step_results = update.get("step_results", [])
+                    last_step = step_results[-1] if step_results else {}
+                    citation = last_step.get("citation")
+                    confidence = last_step.get("confidence", "")
+                    expert_name = node_name.replace("handle_", "")
+                    
+                    # Build rich status message
+                    msg = f"🔬 Expert '{expert_name}' completed"
+                    if citation and hasattr(citation, 'data_grounded') and citation.data_grounded:
+                        msg += f" — {citation.row_count:,} rows from {citation.datasource_name}"
+                    if confidence:
+                        msg += f" | {confidence}"
+                    if last_step.get("error"):
+                        msg = f"⚠️ Expert '{expert_name}' failed: {str(last_step.get('error'))[:80]}"
+                    
+                    yield {
+                        "event": "querying",
+                        "message": msg
+                    }
+                elif node_name == "handle_dashboard_action":
+                    yield {
+                        "event": "thinking",
+                        "message": "Preparing dashboard action..."
+                    }
+            
+            # Final result from history/state
+            # We pull the final state from the checkpointer
+            final_state_ref = await self.graph.aget_state(config)
+            state_data = final_state_ref.values
+            
+            yield {
+                "event": "complete",
+                "data": {
+                    "success": state_data.get("status") == "complete",
+                    "intent": state_data.get("intent"),
+                    "query_type": state_data.get("query_type"),
+                    "context_scope": state_data.get("context_scope"),
+                    "analysis": state_data.get("analysis"),
+                    "results": state_data.get("results"),
+                    "visualization": state_data.get("visualization"),
+                    "needs_clarification": state_data.get("needs_clarification", False),
+                    "error": state_data.get("error"),
+                    "thread_id": effective_thread_id,
+                    # Structured trust metadata for frontend rendering
+                    "trust": self._build_trust_metadata(state_data),
+                }
+            }
+        except Exception as e:
+            logger.exception("process_stream failed", error=str(e))
+            yield {
+                "event": "error",
+                "data": {
+                    "success": False,
+                    "error": str(e)
+                }
             }
 
 

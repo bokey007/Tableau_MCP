@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Base
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 
 from src.core.config import settings
 from src.core.exceptions import ValidationError
@@ -293,19 +294,21 @@ Query Executed:
 Data:
 {results}
 
-CRITICAL RULES:
-- If the query used an aggregate function (SUM, AVG, COUNT, MAX, MIN) and returned 
-  a single row, do NOT claim patterns about "variation", "uniformity", or "consistency"
-- A single aggregate value has no variance by definition - don't over-interpret it
-- Only describe what the actual data shows, never speculate beyond the results
+== STRICT RULES (VIOLATION = FAILURE) ==
+1. NEVER state a number that does not appear in the Data section above.
+2. NEVER calculate percentages, ratios, or growth rates in your head — use the calculator tools.
+3. If the data has < 3 rows, do NOT claim "trends", "patterns", or "consistency".
+4. If a single aggregate row was returned, describe its VALUE only. Do not invent variance or patterns.
+5. If the data is insufficient to answer the question, say: "The available data does not contain enough information to answer this. Consider querying [specific suggestion]."
+6. Reference specific column names and values as evidence for every claim.
 
-Provide a comprehensive analysis including:
-1. **Direct Answer**: Clearly answer the original question
-2. **Key Findings**: Highlight the most important patterns or values
-3. **Insights**: Provide actionable business insights based on the data
-4. **Context**: Note any limitations or considerations
+== OUTPUT FORMAT ==
+1. **Direct Answer**: One-line answer to the user's question, citing the exact numbers from the data.
+2. **Key Findings**: Bullet points highlighting the most important values. Each bullet must cite a row/column from the data.
+3. **Insights**: Actionable business insights grounded in the data. No speculation.
+4. **Data Quality Note**: Mention if data was truncated, aggregated, or if any nulls were present.
 
-Be concise but thorough."""
+Be concise but thorough. Every claim must be traceable to a row in the data above."""
 
 
 INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for a Tableau data analysis assistant.
@@ -367,13 +370,21 @@ class TableauAgent:
         self._compiled_graph = None
     
     @classmethod
-    def get_checkpointer(cls) -> MemorySaver:
-        """Get or create the shared checkpointer instance."""
+    def get_checkpointer(cls):
+        """Get or create the shared checkpointer instance.
+        
+        Uses PostgreSQL for persistence (survives container restarts).
+        Falls back to MemorySaver if Postgres is unavailable.
+        """
         if cls._checkpointer is None:
-            # Use MemorySaver for now (can switch to PostgresSaver for full persistence)
-            # For PostgresSaver: from langgraph.checkpoint.postgres import PostgresSaver
-            cls._checkpointer = MemorySaver()
-            logger.info("Initialized LangGraph MemorySaver checkpointer")
+            try:
+                db_url = settings.sync_database_url
+                cls._checkpointer = PostgresSaver.from_conn_string(db_url)
+                cls._checkpointer.setup()  # Create tables if they don't exist
+                logger.info("Initialized PostgreSQL-backed checkpointer (Data Agent)")
+            except Exception as e:
+                logger.warning(f"PostgreSQL checkpointer failed, falling back to MemorySaver: {e}")
+                cls._checkpointer = MemorySaver()
         return cls._checkpointer
     
     async def get_cached_metadata(self, datasource_id: str) -> Optional[DatasourceMetadata]:

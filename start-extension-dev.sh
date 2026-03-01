@@ -109,29 +109,57 @@ sleep 2
 > "$BACKEND_LOG"
 > "$EXTENSION_LOG"
 
-# Start backend tunnel (port 8000)
-cloudflared tunnel --url http://localhost:8000 > "$BACKEND_LOG" 2>&1 &
-BACKEND_PID=$!
+# Retry tunnel creation up to 3 times
+BACKEND_TUNNEL=""
+EXTENSION_TUNNEL=""
 
-# Start extension tunnel (port 8080)
-cloudflared tunnel --url http://localhost:8080 > "$EXTENSION_LOG" 2>&1 &
-EXTENSION_PID=$!
+for ATTEMPT in 1 2 3; do
+    echo -e "  ${YELLOW}Attempt ${ATTEMPT}/3...${NC}"
 
-# Wait for tunnels to establish
-echo -n "  Waiting for tunnels"
-for i in {1..20}; do
-    BACKEND_TUNNEL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$BACKEND_LOG" 2>/dev/null | head -1)
-    EXTENSION_TUNNEL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$EXTENSION_LOG" 2>/dev/null | head -1)
+    # Clear logs for this attempt
+    > "$BACKEND_LOG"
+    > "$EXTENSION_LOG"
+    pkill -f "cloudflared tunnel" 2>/dev/null || true
+    sleep 2
+
+    # Start backend tunnel (port 8000)
+    cloudflared tunnel --url http://localhost:8000 > "$BACKEND_LOG" 2>&1 &
+    BACKEND_PID=$!
+
+    # Start extension tunnel (port 8080)
+    cloudflared tunnel --url http://localhost:8080 > "$EXTENSION_LOG" 2>&1 &
+    EXTENSION_PID=$!
+
+    # Wait for tunnels to establish
+    echo -n "  Waiting for tunnels"
+    for i in {1..25}; do
+        BACKEND_TUNNEL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$BACKEND_LOG" 2>/dev/null | head -1)
+        EXTENSION_TUNNEL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$EXTENSION_LOG" 2>/dev/null | head -1)
+        if [ -n "$BACKEND_TUNNEL" ] && [ -n "$EXTENSION_TUNNEL" ]; then
+            echo ""
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+
+    # Check if both tunnels are up
     if [ -n "$BACKEND_TUNNEL" ] && [ -n "$EXTENSION_TUNNEL" ]; then
-        echo ""
         break
     fi
-    echo -n "."
-    sleep 1
+
+    echo -e "\n  ${YELLOW}Tunnel attempt ${ATTEMPT} failed, retrying...${NC}"
+    
+    # Show error from logs for debugging
+    grep -i "error\|failed" "$BACKEND_LOG" 2>/dev/null | tail -1 || true
+    
+    BACKEND_TUNNEL=""
+    EXTENSION_TUNNEL=""
+    sleep 3
 done
 
 if [ -z "$BACKEND_TUNNEL" ] || [ -z "$EXTENSION_TUNNEL" ]; then
-    echo -e "\n${RED}✗ Failed to create tunnels. Check logs:${NC}"
+    echo -e "\n${RED}✗ Failed to create tunnels after 3 attempts. Check logs:${NC}"
     echo "  Backend: $BACKEND_LOG"
     echo "  Extension: $EXTENSION_LOG"
     exit 1

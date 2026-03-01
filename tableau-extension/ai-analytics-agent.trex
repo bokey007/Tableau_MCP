@@ -8,7 +8,7 @@
     <min-api-version>1.0</min-api-version>
     <source-location>
       <!-- Cloudflare tunnel URL (tunnels to localhost:8080 for extension HTML) -->
-      <url>https://monsters-infringement-emacs-bishop.trycloudflare.com/index.html</url>
+      <url>https://container-ran-submit-handled.trycloudflare.com/index.html</url>
     </source-location>
     <icon>iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEwAACxMBAJqcGAAAAlhJREFUOI2Nkz1oU2EUhp/v3pt7k5tEm9ikttQfxFYUBx1UHFQQXBwEF8HNQRgFwcVBcBTERbcidnQQlNJFHKQgThYFB5EiVGkTfzBpkhhj7s+5t+fiYCNU0wze4XDg/X7O+5wD/wgZMvBvJAQYWPdDa6uy51dL/dnvk3+mjf7F3bw/s5JVkuSZ7X6e6W7/lC1Xn8yvJGf0C9cvX1cPH4GUwpLg5GgjDxwlqPTFbwd4WssN11dnLi4s+tONpuZDCAmEGlIKpgCL0LpFCE1f+XjnRtNxuD7/s/d06u/b4wsbFHk1Qk3PYHfPbqmxCGSHE/Jzp9XvT/0YG/vp+mBv7bD3TjZ/bycR4hIlwZiWHMXIcl4bLXLVqdNT+vnOvNxfHD/pNjsLPEQ62gJy5eMRqlmrCTAUQlFbfHJN5tzz3kKymR8vntqfHTvnepb6B+t0tPRK9c7Sl3e8hzn24lkv+s3+wqWTu3Llr7Nnzx1MTR8KbhQ08wsv1OHeLxzc7yQXB98J5CYJCN4s8mh53z335z9/fz7c98FfWA4/rlU/fdG2Z1dnRynfc8pNL2xTsxpJ/vHE6dGpo0dOzr8avh+NrnP6rnr2nxWCvhgqVFIa8g0TcOPJ9VBJEqvnf83mFqb3jA5Pn/tngN9qeGvVoGW8wlO7J+d0+XWvbG7drw6rrSUCw2B5IYQXoLSYVOBxD/4sJNj4bY0mFl/rqhtmWEsKwiCwjRpSCf5zCQPICOzyPwf2AtcBB7gOHATuBi8DDwA2A98BVwF14O9SANcA1yBbvgGqgQvAM8AM4CTwE/AIuAz/gF+IJpRNfkZDoAAAAABJRU5ErkJggg==</icon>
     <permissions>
